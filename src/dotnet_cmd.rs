@@ -95,10 +95,15 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
 
     let filtered = match subcommand {
         "build" => {
-            let summary = normalize_build_summary(
+            let binlog_summary = normalize_build_summary(
                 binlog::parse_build(&binlog_path)?,
                 output.status.success(),
             );
+            let raw_summary = normalize_build_summary(
+                binlog::parse_build_from_text(&raw),
+                output.status.success(),
+            );
+            let summary = merge_build_summaries(binlog_summary, raw_summary);
             format_build_output(&summary, &binlog_path)
         }
         "test" => {
@@ -259,6 +264,87 @@ fn normalize_build_summary(
     }
 
     summary
+}
+
+fn merge_build_summaries(
+    mut binlog_summary: binlog::BuildSummary,
+    raw_summary: binlog::BuildSummary,
+) -> binlog::BuildSummary {
+    binlog_summary.errors = select_preferred_issues(binlog_summary.errors, raw_summary.errors);
+    binlog_summary.warnings =
+        select_preferred_issues(binlog_summary.warnings, raw_summary.warnings);
+
+    if binlog_summary.project_count == 0 {
+        binlog_summary.project_count = raw_summary.project_count;
+    }
+    if binlog_summary.duration_text.is_none() {
+        binlog_summary.duration_text = raw_summary.duration_text;
+    }
+
+    binlog_summary
+}
+
+fn select_preferred_issues(
+    binlog_issues: Vec<binlog::BinlogIssue>,
+    raw_issues: Vec<binlog::BinlogIssue>,
+) -> Vec<binlog::BinlogIssue> {
+    if binlog_issues.is_empty() {
+        return raw_issues;
+    }
+    if raw_issues.is_empty() {
+        return binlog_issues;
+    }
+
+    let binlog_score = issues_quality_score(&binlog_issues);
+    let raw_score = issues_quality_score(&raw_issues);
+
+    if raw_score > binlog_score
+        || (raw_score == binlog_score && raw_issues.len() > binlog_issues.len())
+    {
+        raw_issues
+    } else {
+        binlog_issues
+    }
+}
+
+fn issues_quality_score(issues: &[binlog::BinlogIssue]) -> usize {
+    issues.iter().map(issue_quality_score).sum()
+}
+
+fn issue_quality_score(issue: &binlog::BinlogIssue) -> usize {
+    let mut score = 0;
+
+    if !issue.file.is_empty() && !looks_like_diagnostic_token(&issue.file) {
+        score += 4;
+    }
+    if !issue.code.is_empty() {
+        score += 2;
+    }
+    if issue.line > 0 {
+        score += 1;
+    }
+    if issue.column > 0 {
+        score += 1;
+    }
+
+    score
+}
+
+fn looks_like_diagnostic_token(value: &str) -> bool {
+    let mut letters = 0;
+    let mut digits = 0;
+
+    for c in value.chars() {
+        if c.is_ascii_alphabetic() {
+            letters += 1;
+        } else if c.is_ascii_digit() {
+            digits += 1;
+        } else {
+            return false;
+        }
+    }
+
+    letters >= 2 && digits >= 3
 }
 
 fn normalize_test_summary(
@@ -540,6 +626,86 @@ mod tests {
         let normalized = normalize_build_summary(summary, true);
         assert!(normalized.succeeded);
         assert_eq!(normalized.project_count, 1);
+    }
+
+    #[test]
+    fn test_merge_build_summaries_prefers_raw_when_binlog_loses_context() {
+        let binlog_summary = binlog::BuildSummary {
+            succeeded: false,
+            project_count: 11,
+            errors: vec![binlog::BinlogIssue {
+                code: String::new(),
+                file: "IDE0055".to_string(),
+                line: 0,
+                column: 0,
+                message: "Fix formatting".to_string(),
+            }],
+            warnings: Vec::new(),
+            duration_text: Some("00:00:03.54".to_string()),
+        };
+
+        let raw_summary = binlog::BuildSummary {
+            succeeded: false,
+            project_count: 2,
+            errors: vec![
+                binlog::BinlogIssue {
+                    code: "IDE0055".to_string(),
+                    file: "/repo/src/Behavior.cs".to_string(),
+                    line: 13,
+                    column: 32,
+                    message: "Fix formatting".to_string(),
+                },
+                binlog::BinlogIssue {
+                    code: "IDE0055".to_string(),
+                    file: "/repo/src/Behavior.cs".to_string(),
+                    line: 13,
+                    column: 41,
+                    message: "Fix formatting".to_string(),
+                },
+            ],
+            warnings: Vec::new(),
+            duration_text: Some("00:00:03.54".to_string()),
+        };
+
+        let merged = merge_build_summaries(binlog_summary, raw_summary);
+        assert_eq!(merged.project_count, 11);
+        assert_eq!(merged.errors.len(), 2);
+        assert_eq!(merged.errors[0].line, 13);
+        assert_eq!(merged.errors[0].column, 32);
+    }
+
+    #[test]
+    fn test_merge_build_summaries_keeps_binlog_when_context_is_good() {
+        let binlog_summary = binlog::BuildSummary {
+            succeeded: false,
+            project_count: 2,
+            errors: vec![binlog::BinlogIssue {
+                code: "CS0103".to_string(),
+                file: "src/Program.cs".to_string(),
+                line: 42,
+                column: 15,
+                message: "The name 'foo' does not exist".to_string(),
+            }],
+            warnings: Vec::new(),
+            duration_text: Some("00:00:01.00".to_string()),
+        };
+
+        let raw_summary = binlog::BuildSummary {
+            succeeded: false,
+            project_count: 2,
+            errors: vec![binlog::BinlogIssue {
+                code: "CS0103".to_string(),
+                file: String::new(),
+                line: 0,
+                column: 0,
+                message: "Build error #1 (details omitted)".to_string(),
+            }],
+            warnings: Vec::new(),
+            duration_text: None,
+        };
+
+        let merged = merge_build_summaries(binlog_summary.clone(), raw_summary);
+        assert_eq!(merged.errors, binlog_summary.errors);
     }
 
     #[test]

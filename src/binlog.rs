@@ -123,34 +123,105 @@ const STRING_RECORD_START_INDEX: i32 = 10;
 pub fn parse_build(binlog_path: &Path) -> Result<BuildSummary> {
     let parsed = parse_events_from_binlog(binlog_path)
         .with_context(|| format!("Failed to parse binlog at {}", binlog_path.display()))?;
+    let strings_blob = parsed.string_records.join("\n");
+    let text_fallback = parse_build_from_text(&strings_blob);
 
     let duration_text = match (parsed.build_started_ticks, parsed.build_finished_ticks) {
         (Some(start), Some(end)) if end >= start => Some(format_ticks_duration(end - start)),
         _ => None,
     };
 
+    let parsed_project_count = parsed.project_files.len();
+
     Ok(BuildSummary {
         succeeded: parsed.build_succeeded.unwrap_or(false),
-        project_count: parsed.project_files.len(),
-        errors: parsed.errors,
-        warnings: parsed.warnings,
+        project_count: if parsed_project_count > 0 {
+            parsed_project_count
+        } else {
+            text_fallback.project_count
+        },
+        errors: select_best_issues(parsed.errors, text_fallback.errors),
+        warnings: select_best_issues(parsed.warnings, text_fallback.warnings),
         duration_text,
     })
+}
+
+fn select_best_issues(primary: Vec<BinlogIssue>, fallback: Vec<BinlogIssue>) -> Vec<BinlogIssue> {
+    if primary.is_empty() {
+        return fallback;
+    }
+    if fallback.is_empty() {
+        return primary;
+    }
+
+    if primary.iter().all(is_suspicious_issue) && fallback.iter().any(is_contextual_issue) {
+        return fallback;
+    }
+
+    let primary_score = issues_quality_score(&primary);
+    let fallback_score = issues_quality_score(&fallback);
+    if fallback_score > primary_score {
+        fallback
+    } else {
+        primary
+    }
+}
+
+fn issues_quality_score(issues: &[BinlogIssue]) -> usize {
+    issues.iter().map(issue_quality_score).sum()
+}
+
+fn issue_quality_score(issue: &BinlogIssue) -> usize {
+    let mut score = 0;
+
+    if is_contextual_issue(issue) {
+        score += 4;
+    }
+    if !issue.code.is_empty() && is_likely_diagnostic_code(&issue.code) {
+        score += 2;
+    }
+    if issue.line > 0 {
+        score += 1;
+    }
+    if issue.column > 0 {
+        score += 1;
+    }
+    if !issue.message.is_empty() && issue.message != "Build issue" {
+        score += 1;
+    }
+
+    score
+}
+
+fn is_contextual_issue(issue: &BinlogIssue) -> bool {
+    !issue.file.is_empty() && !is_likely_diagnostic_code(&issue.file)
+}
+
+fn is_suspicious_issue(issue: &BinlogIssue) -> bool {
+    issue.code.is_empty() && is_likely_diagnostic_code(&issue.file)
 }
 
 pub fn parse_test(binlog_path: &Path) -> Result<TestSummary> {
     let parsed = parse_events_from_binlog(binlog_path)
         .with_context(|| format!("Failed to parse binlog at {}", binlog_path.display()))?;
-    let mut summary = parse_test_from_text(&parsed.messages.join("\n"));
-    summary.project_count = summary.project_count.max(parsed.project_files.len());
+    let blob = parsed.string_records.join("\n");
+    let mut summary = parse_test_from_text(&blob);
+    let parsed_project_count = parsed.project_files.len();
+    if parsed_project_count > 0 {
+        summary.project_count = parsed_project_count;
+    }
     Ok(summary)
 }
 
 pub fn parse_restore(binlog_path: &Path) -> Result<RestoreSummary> {
     let parsed = parse_events_from_binlog(binlog_path)
         .with_context(|| format!("Failed to parse binlog at {}", binlog_path.display()))?;
-    let mut summary = parse_restore_from_text(&parsed.messages.join("\n"));
-    summary.restored_projects = summary.restored_projects.max(parsed.project_files.len());
+    let blob = parsed.string_records.join("\n");
+    let mut summary = parse_restore_from_text(&blob);
+    let parsed_project_count = parsed.project_files.len();
+    if parsed_project_count > 0 {
+        summary.restored_projects = parsed_project_count;
+    }
     Ok(summary)
 }
 
@@ -244,7 +315,8 @@ fn parse_events_from_binlog(path: &Path) -> Result<ParsedBinlog> {
                     .read_exact(len as usize)
                     .context("failed to read event payload")?;
                 let mut event_reader = BinReader::new(payload);
-                parse_event_record(kind, &mut event_reader, file_format_version, &mut parsed)?;
+                let _ =
+                    parse_event_record(kind, &mut event_reader, file_format_version, &mut parsed);
             }
         }
     }
@@ -421,7 +493,7 @@ fn read_deduplicated_string(
 
 fn format_ticks_duration(ticks: i64) -> String {
     let total_seconds = ticks.div_euclid(10_000_000);
-    let centiseconds = (ticks.rem_euclid(10_000_000) / 100_000) as i64;
+    let centiseconds = ticks.rem_euclid(10_000_000) / 100_000;
     let hours = total_seconds / 3600;
     let minutes = (total_seconds % 3600) / 60;
     let seconds = total_seconds % 60;
@@ -1171,5 +1243,49 @@ Time Elapsed 00:00:00.12
         assert!(is_likely_diagnostic_code("MSB4018"));
         assert!(!is_likely_diagnostic_code("NET451"));
         assert!(!is_likely_diagnostic_code("NET10"));
+    }
+
+    #[test]
+    fn test_select_best_issues_prefers_fallback_when_primary_loses_context() {
+        let primary = vec![BinlogIssue {
+            code: String::new(),
+            file: "CS1525".to_string(),
+            line: 51,
+            column: 1,
+            message: "Invalid expression term ';'".to_string(),
+        }];
+
+        let fallback = vec![BinlogIssue {
+            code: "CS1525".to_string(),
+            file: "/Users/dev/project/src/NServiceBus.Core/Class1.cs".to_string(),
+            line: 1,
+            column: 9,
+            message: "Invalid expression term ';'".to_string(),
+        }];
+
+        let selected = select_best_issues(primary, fallback.clone());
+        assert_eq!(selected, fallback);
+    }
+
+    #[test]
+    fn test_select_best_issues_keeps_primary_when_context_is_good() {
+        let primary = vec![BinlogIssue {
+            code: "CS0103".to_string(),
+            file: "src/Program.cs".to_string(),
+            line: 42,
+            column: 15,
+            message: "The name 'foo' does not exist".to_string(),
+        }];
+
+        let fallback = vec![BinlogIssue {
+            code: "CS0103".to_string(),
+            file: String::new(),
+            line: 0,
+            column: 0,
+            message: "Build error #1 (details omitted)".to_string(),
+        }];
+
+        let selected = select_best_issues(primary.clone(), fallback);
+        assert_eq!(selected, primary);
     }
 }
