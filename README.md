@@ -176,7 +176,7 @@ rtk pip list                     # Python packages (auto-detect uv, 70% reductio
 rtk go test                      # Go tests (NDJSON, 90% reduction)
 rtk golangci-lint run            # Go linting (JSON, 85% reduction)
 rtk dotnet build                 # .NET build summary with binlog
-rtk dotnet test                  # .NET test failures only
+rtk dotnet test                  # .NET failures only (auto TRX + fallback parsing)
 rtk dotnet restore               # .NET restore summary
 ```
 
@@ -288,9 +288,15 @@ rtk golangci-lint run            # JSON grouped by rule (85% reduction)
 
 # .NET
 rtk dotnet build                 # Build errors/warnings summary with binlog
-rtk dotnet test                  # Failed tests only with compact details
+rtk dotnet test                  # Failed tests only (auto TRX cleanup, TestResults fallback)
 rtk dotnet restore               # Restore project/package summary
 ```
+
+Dotnet behavior notes:
+- RTK forwards your dotnet args as-is (`--configuration`, `--framework`, `--project`, `--no-build`, `--no-restore`, `--filter`, etc.).
+- RTK only injects defaults when missing (`-bl`, `-v:minimal`, `-nologo`) and does not override your explicit `-v` / `--logger`.
+- For `rtk dotnet test`, RTK auto-generates a TRX file, parses it when binlog/console counts are unavailable, then cleans up that temp TRX file.
+- If temp TRX is missing, RTK falls back to the newest `./TestResults/*.trx` file.
 
 ## Examples
 

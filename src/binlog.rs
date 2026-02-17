@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinlogIssue {
@@ -525,6 +525,34 @@ pub fn parse_trx_file(path: &Path) -> Option<TestSummary> {
     parse_trx_content(&content)
 }
 
+pub fn find_recent_trx_in_testresults() -> Option<PathBuf> {
+    find_recent_trx_in_dir(Path::new("./TestResults"))
+}
+
+fn find_recent_trx_in_dir(dir: &Path) -> Option<PathBuf> {
+    if !dir.exists() {
+        return None;
+    }
+
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_trx = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("trx"));
+            if !is_trx {
+                return None;
+            }
+
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
 fn parse_trx_content(content: &str) -> Option<TestSummary> {
     // Quick check if this looks like a TRX file
     if !content.contains("<TestRun") || !content.contains("</TestRun>") {
@@ -603,6 +631,7 @@ fn parse_trx_content(content: &str) -> Option<TestSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_scrub_sensitive_env_vars_masks_values() {
@@ -795,5 +824,43 @@ Time Elapsed 00:00:00.12
     fn test_parse_trx_content_returns_none_for_invalid_xml() {
         let not_trx = "This is not a TRX file";
         assert!(parse_trx_content(not_trx).is_none());
+    }
+
+    #[test]
+    fn test_find_recent_trx_in_dir_returns_none_when_missing() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing_dir = temp_dir.path().join("TestResults");
+
+        let found = find_recent_trx_in_dir(&missing_dir);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_recent_trx_in_dir_picks_newest_trx() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let testresults_dir = temp_dir.path().join("TestResults");
+        std::fs::create_dir_all(&testresults_dir).expect("create TestResults");
+
+        let old_trx = testresults_dir.join("old.trx");
+        let new_trx = testresults_dir.join("new.trx");
+        std::fs::write(&old_trx, "old").expect("write old");
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&new_trx, "new").expect("write new");
+
+        let found = find_recent_trx_in_dir(&testresults_dir).expect("should find newest trx");
+        assert_eq!(found, new_trx);
+    }
+
+    #[test]
+    fn test_find_recent_trx_in_dir_ignores_non_trx_files() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let testresults_dir = temp_dir.path().join("TestResults");
+        std::fs::create_dir_all(&testresults_dir).expect("create TestResults");
+
+        let txt = testresults_dir.join("notes.txt");
+        std::fs::write(&txt, "noop").expect("write txt");
+
+        let found = find_recent_trx_in_dir(&testresults_dir);
+        assert!(found.is_none());
     }
 }
