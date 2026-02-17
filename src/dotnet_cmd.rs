@@ -96,14 +96,14 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     let filtered = match subcommand {
         "build" => {
             let summary = normalize_build_summary(
-                binlog::parse_build(&binlog_path, &raw)?,
+                binlog::parse_build(&binlog_path)?,
                 output.status.success(),
             );
             format_build_output(&summary, &binlog_path)
         }
         "test" => {
             // First try to parse from binlog/console output
-            let parsed_summary = binlog::parse_test(&binlog_path, &raw)?;
+            let parsed_summary = binlog::parse_test(&binlog_path)?;
             let summary = maybe_fill_test_summary_from_trx(
                 parsed_summary,
                 trx_path.as_deref(),
@@ -114,7 +114,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
             format_test_output(&summary, &binlog_path)
         }
         "restore" => {
-            let summary = binlog::parse_restore(&binlog_path, &raw)?;
+            let summary = binlog::parse_restore(&binlog_path)?;
             format_restore_output(&summary, &binlog_path)
         }
         _ => raw.clone(),

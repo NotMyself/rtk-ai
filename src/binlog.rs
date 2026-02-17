@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use flate2::read::{DeflateDecoder, GzDecoder};
+use flate2::read::GzDecoder;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,19 +98,414 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
     "KUBECONFIG",
 ];
 
-pub fn parse_build(binlog_path: &Path, fallback_output: &str) -> Result<BuildSummary> {
-    let source = load_binlog_text(binlog_path).unwrap_or_else(|| fallback_output.to_string());
-    Ok(parse_build_from_text(&source))
+const RECORD_END_OF_FILE: i32 = 0;
+const RECORD_BUILD_STARTED: i32 = 1;
+const RECORD_BUILD_FINISHED: i32 = 2;
+const RECORD_PROJECT_STARTED: i32 = 3;
+const RECORD_PROJECT_FINISHED: i32 = 4;
+const RECORD_ERROR: i32 = 9;
+const RECORD_WARNING: i32 = 10;
+const RECORD_MESSAGE: i32 = 11;
+const RECORD_CRITICAL_BUILD_MESSAGE: i32 = 13;
+const RECORD_PROJECT_IMPORT_ARCHIVE: i32 = 17;
+const RECORD_NAME_VALUE_LIST: i32 = 23;
+const RECORD_STRING: i32 = 24;
+
+const FLAG_BUILD_EVENT_CONTEXT: i32 = 1 << 0;
+const FLAG_MESSAGE: i32 = 1 << 2;
+const FLAG_TIMESTAMP: i32 = 1 << 5;
+const FLAG_ARGUMENTS: i32 = 1 << 14;
+const FLAG_IMPORTANCE: i32 = 1 << 15;
+const FLAG_EXTENDED: i32 = 1 << 16;
+
+const STRING_RECORD_START_INDEX: i32 = 10;
+
+pub fn parse_build(binlog_path: &Path) -> Result<BuildSummary> {
+    let parsed = parse_events_from_binlog(binlog_path)
+        .with_context(|| format!("Failed to parse binlog at {}", binlog_path.display()))?;
+
+    let duration_text = match (parsed.build_started_ticks, parsed.build_finished_ticks) {
+        (Some(start), Some(end)) if end >= start => Some(format_ticks_duration(end - start)),
+        _ => None,
+    };
+
+    Ok(BuildSummary {
+        succeeded: parsed.build_succeeded.unwrap_or(false),
+        project_count: parsed.project_files.len(),
+        errors: parsed.errors,
+        warnings: parsed.warnings,
+        duration_text,
+    })
 }
 
-pub fn parse_test(binlog_path: &Path, fallback_output: &str) -> Result<TestSummary> {
-    let source = load_binlog_text(binlog_path).unwrap_or_else(|| fallback_output.to_string());
-    Ok(parse_test_from_text(&source))
+pub fn parse_test(binlog_path: &Path) -> Result<TestSummary> {
+    let parsed = parse_events_from_binlog(binlog_path)
+        .with_context(|| format!("Failed to parse binlog at {}", binlog_path.display()))?;
+    let mut summary = parse_test_from_text(&parsed.messages.join("\n"));
+    summary.project_count = summary.project_count.max(parsed.project_files.len());
+    Ok(summary)
 }
 
-pub fn parse_restore(binlog_path: &Path, fallback_output: &str) -> Result<RestoreSummary> {
-    let source = load_binlog_text(binlog_path).unwrap_or_else(|| fallback_output.to_string());
-    Ok(parse_restore_from_text(&source))
+pub fn parse_restore(binlog_path: &Path) -> Result<RestoreSummary> {
+    let parsed = parse_events_from_binlog(binlog_path)
+        .with_context(|| format!("Failed to parse binlog at {}", binlog_path.display()))?;
+    let mut summary = parse_restore_from_text(&parsed.messages.join("\n"));
+    summary.restored_projects = summary.restored_projects.max(parsed.project_files.len());
+    Ok(summary)
+}
+
+#[derive(Default)]
+struct ParsedBinlog {
+    string_records: Vec<String>,
+    messages: Vec<String>,
+    project_files: HashSet<String>,
+    errors: Vec<BinlogIssue>,
+    warnings: Vec<BinlogIssue>,
+    build_succeeded: Option<bool>,
+    build_started_ticks: Option<i64>,
+    build_finished_ticks: Option<i64>,
+}
+
+#[derive(Default)]
+struct ParsedEventFields {
+    message: Option<String>,
+    timestamp_ticks: Option<i64>,
+}
+
+fn parse_events_from_binlog(path: &Path) -> Result<ParsedBinlog> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read binlog at {}", path.display()))?;
+    if bytes.is_empty() {
+        anyhow::bail!("Failed to parse binlog at {}: empty file", path.display());
+    }
+
+    let mut decoder = GzDecoder::new(bytes.as_slice());
+    let mut payload = Vec::new();
+    decoder.read_to_end(&mut payload).with_context(|| {
+        format!(
+            "Failed to parse binlog at {}: gzip decode failed",
+            path.display()
+        )
+    })?;
+
+    let mut reader = BinReader::new(&payload);
+    let file_format_version = reader
+        .read_i32_le()
+        .context("binlog header missing file format version")?;
+    let _minimum_reader_version = reader
+        .read_i32_le()
+        .context("binlog header missing minimum reader version")?;
+
+    if file_format_version < 18 {
+        anyhow::bail!(
+            "Failed to parse binlog at {}: unsupported binlog format {}",
+            path.display(),
+            file_format_version
+        );
+    }
+
+    let mut parsed = ParsedBinlog::default();
+
+    while !reader.is_eof() {
+        let kind = reader
+            .read_7bit_i32()
+            .context("failed to read record kind")?;
+        if kind == RECORD_END_OF_FILE {
+            break;
+        }
+
+        match kind {
+            RECORD_STRING => {
+                let text = reader
+                    .read_dotnet_string()
+                    .context("failed to read string record")?;
+                parsed.string_records.push(text);
+            }
+            RECORD_NAME_VALUE_LIST | RECORD_PROJECT_IMPORT_ARCHIVE => {
+                let len = reader
+                    .read_7bit_i32()
+                    .context("failed to read record length")?;
+                if len < 0 {
+                    anyhow::bail!("negative record length: {}", len);
+                }
+                reader
+                    .skip(len as usize)
+                    .context("failed to skip auxiliary record payload")?;
+            }
+            _ => {
+                let len = reader
+                    .read_7bit_i32()
+                    .context("failed to read event length")?;
+                if len < 0 {
+                    anyhow::bail!("negative event length: {}", len);
+                }
+
+                let payload = reader
+                    .read_exact(len as usize)
+                    .context("failed to read event payload")?;
+                let mut event_reader = BinReader::new(payload);
+                parse_event_record(kind, &mut event_reader, file_format_version, &mut parsed)?;
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn parse_event_record(
+    kind: i32,
+    reader: &mut BinReader<'_>,
+    file_format_version: i32,
+    parsed: &mut ParsedBinlog,
+) -> Result<()> {
+    match kind {
+        RECORD_BUILD_STARTED => {
+            let fields = read_event_fields(reader, file_format_version, parsed, false)?;
+            parsed.build_started_ticks = fields.timestamp_ticks;
+        }
+        RECORD_BUILD_FINISHED => {
+            let fields = read_event_fields(reader, file_format_version, parsed, false)?;
+            parsed.build_finished_ticks = fields.timestamp_ticks;
+            parsed.build_succeeded = Some(reader.read_bool()?);
+        }
+        RECORD_PROJECT_STARTED => {
+            let _fields = read_event_fields(reader, file_format_version, parsed, false)?;
+            if reader.read_bool()? {
+                skip_build_event_context(reader, file_format_version)?;
+            }
+            if let Some(project_file) = read_optional_string(reader, parsed)? {
+                if !project_file.is_empty() {
+                    parsed.project_files.insert(project_file);
+                }
+            }
+        }
+        RECORD_PROJECT_FINISHED => {
+            let _fields = read_event_fields(reader, file_format_version, parsed, false)?;
+            if let Some(project_file) = read_optional_string(reader, parsed)? {
+                if !project_file.is_empty() {
+                    parsed.project_files.insert(project_file);
+                }
+            }
+            let _ = reader.read_bool()?;
+        }
+        RECORD_ERROR | RECORD_WARNING => {
+            let fields = read_event_fields(reader, file_format_version, parsed, false)?;
+
+            let _subcategory = read_optional_string(reader, parsed)?;
+            let code = read_optional_string(reader, parsed)?.unwrap_or_default();
+            let file = read_optional_string(reader, parsed)?.unwrap_or_default();
+            let _project_file = read_optional_string(reader, parsed)?;
+            let line = reader.read_7bit_i32()?.max(0) as u32;
+            let column = reader.read_7bit_i32()?.max(0) as u32;
+            let _ = reader.read_7bit_i32()?;
+            let _ = reader.read_7bit_i32()?;
+
+            let issue = BinlogIssue {
+                code,
+                file,
+                line,
+                column,
+                message: fields.message.unwrap_or_default(),
+            };
+
+            if kind == RECORD_ERROR {
+                parsed.errors.push(issue);
+            } else {
+                parsed.warnings.push(issue);
+            }
+        }
+        RECORD_MESSAGE => {
+            let fields = read_event_fields(reader, file_format_version, parsed, true)?;
+            if let Some(message) = fields.message {
+                parsed.messages.push(message);
+            }
+        }
+        RECORD_CRITICAL_BUILD_MESSAGE => {
+            let fields = read_event_fields(reader, file_format_version, parsed, false)?;
+            if let Some(message) = fields.message {
+                parsed.messages.push(message);
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn read_event_fields(
+    reader: &mut BinReader<'_>,
+    file_format_version: i32,
+    parsed: &ParsedBinlog,
+    read_importance: bool,
+) -> Result<ParsedEventFields> {
+    let flags = reader.read_7bit_i32()?;
+    let mut result = ParsedEventFields::default();
+
+    if flags & FLAG_MESSAGE != 0 {
+        result.message = read_deduplicated_string(reader, parsed)?;
+    }
+
+    if flags & FLAG_BUILD_EVENT_CONTEXT != 0 {
+        skip_build_event_context(reader, file_format_version)?;
+    }
+
+    if flags & FLAG_TIMESTAMP != 0 {
+        result.timestamp_ticks = Some(reader.read_i64_le()?);
+        let _ = reader.read_7bit_i32()?;
+    }
+
+    if flags & FLAG_EXTENDED != 0 {
+        let _ = read_optional_string(reader, parsed)?;
+        skip_string_dictionary(reader, file_format_version)?;
+        let _ = read_optional_string(reader, parsed)?;
+    }
+
+    if flags & FLAG_ARGUMENTS != 0 {
+        let count = reader.read_7bit_i32()?.max(0) as usize;
+        for _ in 0..count {
+            let _ = read_deduplicated_string(reader, parsed)?;
+        }
+    }
+
+    if (file_format_version < 13 && read_importance) || (flags & FLAG_IMPORTANCE != 0) {
+        let _ = reader.read_7bit_i32()?;
+    }
+
+    Ok(result)
+}
+
+fn skip_build_event_context(reader: &mut BinReader<'_>, file_format_version: i32) -> Result<()> {
+    let count = if file_format_version > 1 { 7 } else { 6 };
+    for _ in 0..count {
+        let _ = reader.read_7bit_i32()?;
+    }
+    Ok(())
+}
+
+fn skip_string_dictionary(reader: &mut BinReader<'_>, file_format_version: i32) -> Result<()> {
+    if file_format_version < 10 {
+        anyhow::bail!("legacy dictionary format is unsupported");
+    }
+
+    let _ = reader.read_7bit_i32()?;
+    Ok(())
+}
+
+fn read_optional_string(
+    reader: &mut BinReader<'_>,
+    parsed: &ParsedBinlog,
+) -> Result<Option<String>> {
+    read_deduplicated_string(reader, parsed)
+}
+
+fn read_deduplicated_string(
+    reader: &mut BinReader<'_>,
+    parsed: &ParsedBinlog,
+) -> Result<Option<String>> {
+    let index = reader.read_7bit_i32()?;
+    match index {
+        0 => Ok(None),
+        1 => Ok(Some(String::new())),
+        i if i >= STRING_RECORD_START_INDEX => {
+            let record_idx = (i - STRING_RECORD_START_INDEX) as usize;
+            parsed
+                .string_records
+                .get(record_idx)
+                .cloned()
+                .map(Some)
+                .with_context(|| format!("invalid string record index {}", i))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn format_ticks_duration(ticks: i64) -> String {
+    let total_seconds = ticks.div_euclid(10_000_000);
+    let centiseconds = (ticks.rem_euclid(10_000_000) / 100_000) as i64;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    format!(
+        "{:02}:{:02}:{:02}.{:02}",
+        hours, minutes, seconds, centiseconds
+    )
+}
+
+struct BinReader<'a> {
+    cursor: Cursor<&'a [u8]>,
+}
+
+impl<'a> BinReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: Cursor::new(bytes),
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        (self.cursor.position() as usize) >= self.cursor.get_ref().len()
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8]> {
+        let start = self.cursor.position() as usize;
+        let end = start.saturating_add(len);
+        if end > self.cursor.get_ref().len() {
+            anyhow::bail!("unexpected end of stream");
+        }
+        self.cursor.set_position(end as u64);
+        Ok(&self.cursor.get_ref()[start..end])
+    }
+
+    fn skip(&mut self, len: usize) -> Result<()> {
+        let _ = self.read_exact(len)?;
+        Ok(())
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_bool(&mut self) -> Result<bool> {
+        Ok(self.read_u8()? != 0)
+    }
+
+    fn read_i32_le(&mut self) -> Result<i32> {
+        let b = self.read_exact(4)?;
+        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_i64_le(&mut self) -> Result<i64> {
+        let b = self.read_exact(8)?;
+        Ok(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn read_7bit_i32(&mut self) -> Result<i32> {
+        let mut value: u32 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = self.read_u8()?;
+            value |= ((byte & 0x7F) as u32) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(value as i32);
+            }
+
+            shift += 7;
+            if shift >= 35 {
+                anyhow::bail!("invalid 7-bit encoded integer");
+            }
+        }
+    }
+
+    fn read_dotnet_string(&mut self) -> Result<String> {
+        let len = self.read_7bit_i32()?;
+        if len < 0 {
+            anyhow::bail!("negative string length: {}", len);
+        }
+        let bytes = self.read_exact(len as usize)?;
+        String::from_utf8(bytes.to_vec()).context("invalid UTF-8 string")
+    }
 }
 
 pub fn scrub_sensitive_env_vars(input: &str) -> String {
@@ -234,7 +629,18 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
         }
     }
 
-    if summary.errors.is_empty() {
+    let has_error_signal = scrubbed.contains("Build FAILED")
+        || scrubbed.contains(": error ")
+        || BUILD_SUMMARY_RE.captures_iter(&scrubbed).any(|captures| {
+            let is_error = matches!(captures.name("kind").map(|m| m.as_str()), Some("Error"));
+            let count = captures
+                .name("count")
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            is_error && count > 0
+        });
+
+    if summary.errors.is_empty() && !summary.succeeded && has_error_signal {
         summary.errors = extract_binary_like_issues(&scrubbed);
     }
 
@@ -352,75 +758,6 @@ fn extract_duration(text: &str) -> Option<String> {
         .map(|m| m.as_str().trim().to_string())
 }
 
-fn load_binlog_text(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read binlog at {}", path.display()))
-        .ok()?;
-
-    if bytes.is_empty() {
-        return None;
-    }
-
-    if let Some(decoded) = try_gzip_decode(&bytes) {
-        let text = String::from_utf8_lossy(&decoded).into_owned();
-        if looks_like_console_output(&text) {
-            return Some(text);
-        }
-    }
-
-    if let Some(decoded) = try_deflate_decode(&bytes) {
-        let text = String::from_utf8_lossy(&decoded).into_owned();
-        if looks_like_console_output(&text) {
-            return Some(text);
-        }
-    }
-
-    let plain = String::from_utf8_lossy(&bytes).into_owned();
-    if looks_like_console_output(&plain) {
-        return Some(plain);
-    }
-
-    None
-}
-
-fn looks_like_console_output(text: &str) -> bool {
-    let markers = [
-        "Build succeeded",
-        "Build FAILED",
-        "Passed!",
-        "Failed!",
-        "Time Elapsed",
-        ".csproj",
-        ": error ",
-        ": warning ",
-        "Restored ",
-    ];
-
-    markers.iter().any(|marker| text.contains(marker))
-}
-
-fn try_gzip_decode(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut decoder = GzDecoder::new(bytes);
-    let mut output = Vec::new();
-    if decoder.read_to_end(&mut output).is_ok() && !output.is_empty() {
-        return Some(output);
-    }
-    None
-}
-
-fn try_deflate_decode(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut decoder = DeflateDecoder::new(bytes);
-    let mut output = Vec::new();
-    if decoder.read_to_end(&mut output).is_ok() && !output.is_empty() {
-        return Some(output);
-    }
-    None
-}
-
 fn extract_printable_runs(text: &str) -> Vec<String> {
     let mut runs = Vec::new();
     for captures in PRINTABLE_RUN_RE.captures_iter(text) {
@@ -510,6 +847,40 @@ fn is_likely_diagnostic_code(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    fn write_7bit_i32(buf: &mut Vec<u8>, value: i32) {
+        let mut v = value as u32;
+        while v >= 0x80 {
+            buf.push(((v as u8) & 0x7F) | 0x80);
+            v >>= 7;
+        }
+        buf.push(v as u8);
+    }
+
+    fn write_dotnet_string(buf: &mut Vec<u8>, value: &str) {
+        write_7bit_i32(buf, value.len() as i32);
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn write_event_record(target: &mut Vec<u8>, kind: i32, payload: &[u8]) {
+        write_7bit_i32(target, kind);
+        write_7bit_i32(target, payload.len() as i32);
+        target.extend_from_slice(payload);
+    }
+
+    fn build_minimal_binlog(records: &[u8]) -> Vec<u8> {
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&25_i32.to_le_bytes());
+        plain.extend_from_slice(&18_i32.to_le_bytes());
+        plain.extend_from_slice(records);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).expect("write plain payload");
+        encoder.finish().expect("finish gzip")
+    }
 
     #[test]
     fn test_scrub_sensitive_env_vars_masks_values() {
@@ -579,18 +950,157 @@ Failed!  - Failed:     2, Passed:   245, Skipped:     0, Total:   247, Duration:
     }
 
     #[test]
-    fn test_parse_build_uses_fallback_when_binlog_is_binary() {
+    fn test_parse_build_fails_when_binlog_is_unparseable() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let binlog_path = temp_dir.path().join("build.binlog");
         std::fs::write(&binlog_path, [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00])
             .expect("write binary file");
 
-        let fallback = include_str!("../tests/fixtures/dotnet/build_failed.txt");
-        let summary = parse_build(&binlog_path, fallback).expect("parse should not fail");
+        let err = parse_build(&binlog_path).expect_err("parse should fail");
+        assert!(
+            err.to_string().contains("Failed to parse binlog"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
+    #[test]
+    fn test_parse_build_fails_when_binlog_missing() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let binlog_path = temp_dir.path().join("build.binlog");
+
+        let err = parse_build(&binlog_path).expect_err("parse should fail");
+        assert!(
+            err.to_string().contains("Failed to parse binlog"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_build_reads_structured_events() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let binlog_path = temp_dir.path().join("build.binlog");
+
+        let mut records = Vec::new();
+
+        // String records (index starts at 10)
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(&mut records, "Build started"); // 10
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(&mut records, "Build finished"); // 11
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(&mut records, "src/App.csproj"); // 12
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(&mut records, "The name 'foo' does not exist"); // 13
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(&mut records, "CS0103"); // 14
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(&mut records, "src/Program.cs"); // 15
+
+        // BuildStarted (message + timestamp)
+        let mut build_started = Vec::new();
+        write_7bit_i32(&mut build_started, FLAG_MESSAGE | FLAG_TIMESTAMP);
+        write_7bit_i32(&mut build_started, 10);
+        build_started.extend_from_slice(&1_000_000_000_i64.to_le_bytes());
+        write_7bit_i32(&mut build_started, 1);
+        write_event_record(&mut records, RECORD_BUILD_STARTED, &build_started);
+
+        // ProjectFinished
+        let mut project_finished = Vec::new();
+        write_7bit_i32(&mut project_finished, 0);
+        write_7bit_i32(&mut project_finished, 12);
+        project_finished.push(1);
+        write_event_record(&mut records, RECORD_PROJECT_FINISHED, &project_finished);
+
+        // Error event
+        let mut error_event = Vec::new();
+        write_7bit_i32(&mut error_event, FLAG_MESSAGE);
+        write_7bit_i32(&mut error_event, 13);
+        write_7bit_i32(&mut error_event, 0); // subcategory
+        write_7bit_i32(&mut error_event, 14); // code
+        write_7bit_i32(&mut error_event, 15); // file
+        write_7bit_i32(&mut error_event, 0); // project file
+        write_7bit_i32(&mut error_event, 42);
+        write_7bit_i32(&mut error_event, 10);
+        write_7bit_i32(&mut error_event, 42);
+        write_7bit_i32(&mut error_event, 10);
+        write_event_record(&mut records, RECORD_ERROR, &error_event);
+
+        // BuildFinished (message + timestamp + succeeded)
+        let mut build_finished = Vec::new();
+        write_7bit_i32(&mut build_finished, FLAG_MESSAGE | FLAG_TIMESTAMP);
+        write_7bit_i32(&mut build_finished, 11);
+        build_finished.extend_from_slice(&1_010_000_000_i64.to_le_bytes());
+        write_7bit_i32(&mut build_finished, 1);
+        build_finished.push(1);
+        write_event_record(&mut records, RECORD_BUILD_FINISHED, &build_finished);
+
+        write_7bit_i32(&mut records, RECORD_END_OF_FILE);
+
+        let binlog_bytes = build_minimal_binlog(&records);
+        std::fs::write(&binlog_path, binlog_bytes).expect("write binlog");
+
+        let summary = parse_build(&binlog_path).expect("parse should succeed");
+        assert!(summary.succeeded);
+        assert_eq!(summary.project_count, 1);
         assert_eq!(summary.errors.len(), 1);
-        assert_eq!(summary.warnings.len(), 0);
-        assert_eq!(summary.errors[0].code, "CS1525");
+        assert_eq!(summary.errors[0].code, "CS0103");
+        assert_eq!(summary.duration_text.as_deref(), Some("00:00:01.00"));
+    }
+
+    #[test]
+    fn test_parse_test_reads_message_events() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let binlog_path = temp_dir.path().join("test.binlog");
+
+        let mut records = Vec::new();
+        write_7bit_i32(&mut records, RECORD_STRING);
+        write_dotnet_string(
+            &mut records,
+            "Failed!  - Failed:     1, Passed:     2, Skipped:     0, Total:     3, Duration: 1 s",
+        ); // 10
+
+        let mut message_event = Vec::new();
+        write_7bit_i32(&mut message_event, FLAG_MESSAGE | FLAG_IMPORTANCE);
+        write_7bit_i32(&mut message_event, 10);
+        write_7bit_i32(&mut message_event, 1);
+        write_event_record(&mut records, RECORD_MESSAGE, &message_event);
+
+        write_7bit_i32(&mut records, RECORD_END_OF_FILE);
+        let binlog_bytes = build_minimal_binlog(&records);
+        std::fs::write(&binlog_path, binlog_bytes).expect("write binlog");
+
+        let summary = parse_test(&binlog_path).expect("parse should succeed");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.total, 3);
+    }
+
+    #[test]
+    fn test_parse_test_fails_when_binlog_missing() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let binlog_path = temp_dir.path().join("test.binlog");
+
+        let err = parse_test(&binlog_path).expect_err("parse should fail");
+        assert!(
+            err.to_string().contains("Failed to parse binlog"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_restore_fails_when_binlog_missing() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let binlog_path = temp_dir.path().join("restore.binlog");
+
+        let err = parse_restore(&binlog_path).expect_err("parse should fail");
+        assert!(
+            err.to_string().contains("Failed to parse binlog"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -618,6 +1128,15 @@ Time Elapsed 00:00:00.12
         let summary = parse_build_from_text(input);
         assert_eq!(summary.project_count, 1);
         assert!(summary.succeeded);
+    }
+
+    #[test]
+    fn test_parse_build_does_not_infer_binary_errors_on_successful_build() {
+        let input = "\x0bInvalid expression term ';'\x18\x06CS1525\x18%/tmp/App/Broken.cs\x09\nBuild succeeded.\n    0 Warning(s)\n    0 Error(s)\n";
+
+        let summary = parse_build_from_text(input);
+        assert!(summary.succeeded);
+        assert!(summary.errors.is_empty());
     }
 
     #[test]
