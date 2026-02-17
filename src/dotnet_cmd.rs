@@ -1,4 +1,5 @@
 use crate::binlog;
+use crate::dotnet_trx;
 use crate::tracking;
 use crate::utils::truncate;
 use anyhow::{Context, Result};
@@ -106,7 +107,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
             let summary = maybe_fill_test_summary_from_trx(
                 parsed_summary,
                 trx_path.as_deref(),
-                binlog::find_recent_trx_in_testresults(),
+                dotnet_trx::find_recent_trx_in_testresults(),
             );
 
             let summary = normalize_test_summary(summary, output.status.success());
@@ -158,7 +159,7 @@ fn build_trx_path() -> PathBuf {
 }
 
 fn parse_trx_with_cleanup(path: &Path) -> Option<binlog::TestSummary> {
-    let summary = binlog::parse_trx_file(path)?;
+    let summary = dotnet_trx::parse_trx_file(path)?;
     std::fs::remove_file(path).ok();
     Some(summary)
 }
@@ -179,7 +180,7 @@ fn maybe_fill_test_summary_from_trx(
     }
 
     if let Some(trx) = fallback_trx_path {
-        if let Some(trx_summary) = binlog::parse_trx_file(&trx) {
+        if let Some(trx_summary) = dotnet_trx::parse_trx_file(&trx) {
             return trx_summary;
         }
     }

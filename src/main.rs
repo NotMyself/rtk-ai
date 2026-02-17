@@ -10,6 +10,7 @@ mod diff_cmd;
 mod discover;
 mod display_helpers;
 mod dotnet_cmd;
+mod dotnet_trx;
 mod env_cmd;
 mod filter;
 mod find_cmd;
