@@ -175,6 +175,9 @@ rtk pytest                       # Python tests (failures only, 90% reduction)
 rtk pip list                     # Python packages (auto-detect uv, 70% reduction)
 rtk go test                      # Go tests (NDJSON, 90% reduction)
 rtk golangci-lint run            # Go linting (JSON, 85% reduction)
+rtk dotnet build                 # .NET build summary with binlog
+rtk dotnet test                  # .NET test failures only
+rtk dotnet restore               # .NET restore summary
 ```
 
 ### Data & Analytics
@@ -267,7 +270,7 @@ rtk prisma migrate dev --name x  # Migration summary
 rtk prisma db-push               # Schema push summary
 ```
 
-### Python & Go Stack
+### Python, Go & .NET Stack
 ```bash
 # Python
 rtk ruff check                   # Ruff linter (JSON, 80% reduction)
@@ -282,6 +285,11 @@ rtk go test                      # NDJSON streaming parser (90% reduction)
 rtk go build                     # Build errors only (80% reduction)
 rtk go vet                       # Vet issues (75% reduction)
 rtk golangci-lint run            # JSON grouped by rule (85% reduction)
+
+# .NET
+rtk dotnet build                 # Build errors/warnings summary with binlog
+rtk dotnet test                  # Failed tests only with compact details
+rtk dotnet restore               # Restore project/package summary
 ```
 
 ## Examples

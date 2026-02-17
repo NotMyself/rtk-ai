@@ -1,3 +1,4 @@
+mod binlog;
 mod cargo_cmd;
 mod cc_economics;
 mod ccusage;
@@ -8,6 +9,7 @@ mod deps;
 mod diff_cmd;
 mod discover;
 mod display_helpers;
+mod dotnet_cmd;
 mod env_cmd;
 mod filter;
 mod find_cmd;
@@ -421,6 +423,12 @@ enum Commands {
     Cargo {
         #[command(subcommand)]
         command: CargoCommands,
+    },
+
+    /// .NET CLI commands with compact output
+    Dotnet {
+        #[command(subcommand)]
+        command: DotnetCommands,
     },
 
     /// npm run with filtered output (strip boilerplate)
@@ -848,6 +856,31 @@ enum GoCommands {
         args: Vec<String>,
     },
     /// Passthrough: runs any unsupported go subcommand directly
+    #[command(external_subcommand)]
+    Other(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum DotnetCommands {
+    /// Build with compact output (errors/warnings summary)
+    Build {
+        /// Additional dotnet build arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Test with compact output (failed tests only)
+    Test {
+        /// Additional dotnet test arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Restore with compact output
+    Restore {
+        /// Additional dotnet restore arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Passthrough: runs any unsupported dotnet subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
 }
@@ -1290,6 +1323,21 @@ fn run() -> Result<()> {
             }
             CargoCommands::Other(args) => {
                 cargo_cmd::run_passthrough(&args, cli.verbose)?;
+            }
+        },
+
+        Commands::Dotnet { command } => match command {
+            DotnetCommands::Build { args } => {
+                dotnet_cmd::run_build(&args, cli.verbose)?;
+            }
+            DotnetCommands::Test { args } => {
+                dotnet_cmd::run_test(&args, cli.verbose)?;
+            }
+            DotnetCommands::Restore { args } => {
+                dotnet_cmd::run_restore(&args, cli.verbose)?;
+            }
+            DotnetCommands::Other(args) => {
+                dotnet_cmd::run_passthrough(&args, cli.verbose)?;
             }
         },
 
