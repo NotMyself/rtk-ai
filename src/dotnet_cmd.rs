@@ -204,12 +204,6 @@ fn build_trx_path() -> PathBuf {
     std::env::temp_dir().join(format!("rtk_dotnet_test_{}.trx", ts))
 }
 
-fn parse_trx_with_cleanup(path: &Path) -> Option<binlog::TestSummary> {
-    let summary = dotnet_trx::parse_trx_file(path)?;
-    std::fs::remove_file(path).ok();
-    Some(summary)
-}
-
 fn maybe_fill_test_summary_from_trx(
     summary: binlog::TestSummary,
     trx_path: Option<&Path>,
@@ -220,7 +214,8 @@ fn maybe_fill_test_summary_from_trx(
     }
 
     if let Some(trx) = trx_path.filter(|path| path.exists()) {
-        if let Some(trx_summary) = parse_trx_with_cleanup(trx) {
+        if let Some(trx_summary) = dotnet_trx::parse_trx_file(trx) {
+            std::fs::remove_file(trx).ok();
             return trx_summary;
         }
     }
@@ -280,10 +275,8 @@ fn has_verbosity_arg(args: &[String]) -> bool {
 }
 
 fn has_nologo_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower == "-nologo" || lower == "/nologo"
-    })
+    args.iter()
+        .any(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-nologo" | "/nologo"))
 }
 
 fn has_logger_arg(args: &[String]) -> bool {
@@ -407,7 +400,6 @@ fn format_issue(issue: &binlog::BinlogIssue, kind: &str) -> String {
     if issue.file.is_empty() {
         return format!("  {} {}", kind, truncate(&issue.message, 180));
     }
-
     if issue.code.is_empty() {
         return format!(
             "  {}({},{}) {}: {}",
@@ -418,7 +410,6 @@ fn format_issue(issue: &binlog::BinlogIssue, kind: &str) -> String {
             truncate(&issue.message, 180)
         );
     }
-
     format!(
         "  {}({},{}) {} {}: {}",
         issue.file,
@@ -991,32 +982,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_trx_with_cleanup_deletes_file_after_parse() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let trx_path = temp_dir.path().join("results.trx");
-        let trx = r#"<?xml version="1.0" encoding="utf-8"?>
-<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
-  <ResultSummary outcome="Completed">
-    <Counters total="2" executed="2" passed="2" failed="0" error="0" />
-  </ResultSummary>
-</TestRun>"#;
-        fs::write(&trx_path, trx).expect("write trx");
-
-        let summary = parse_trx_with_cleanup(&trx_path);
-        assert!(summary.is_some());
-        assert!(!trx_path.exists());
-    }
-
-    #[test]
-    fn test_parse_trx_with_cleanup_non_existent_path_returns_none() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let trx_path = temp_dir.path().join("missing.trx");
-
-        let summary = parse_trx_with_cleanup(&trx_path);
-        assert!(summary.is_none());
-    }
-
-    #[test]
     fn test_forwarding_args_with_spaces() {
         let args = vec![
             "--filter".to_string(),
@@ -1145,5 +1110,15 @@ mod tests {
         assert_eq!(filled.total, 2);
         assert_eq!(filled.failed, 1);
         assert!(fallback.exists());
+    }
+
+    #[test]
+    fn test_maybe_fill_test_summary_from_trx_returns_default_when_no_trx() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing = temp_dir.path().join("missing.trx");
+
+        let filled =
+            maybe_fill_test_summary_from_trx(binlog::TestSummary::default(), Some(&missing), None);
+        assert_eq!(filled.total, 0);
     }
 }

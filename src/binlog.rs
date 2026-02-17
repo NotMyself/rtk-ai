@@ -167,14 +167,10 @@ fn select_best_issues(primary: Vec<BinlogIssue>, fallback: Vec<BinlogIssue>) -> 
     if fallback.is_empty() {
         return primary;
     }
-
     if primary.iter().all(is_suspicious_issue) && fallback.iter().any(is_contextual_issue) {
         return fallback;
     }
-
-    let primary_score = issues_quality_score(&primary);
-    let fallback_score = issues_quality_score(&fallback);
-    if fallback_score > primary_score {
+    if issues_quality_score(&fallback) > issues_quality_score(&primary) {
         fallback
     } else {
         primary
@@ -187,7 +183,6 @@ fn issues_quality_score(issues: &[BinlogIssue]) -> usize {
 
 fn issue_quality_score(issue: &BinlogIssue) -> usize {
     let mut score = 0;
-
     if is_contextual_issue(issue) {
         score += 4;
     }
@@ -203,7 +198,6 @@ fn issue_quality_score(issue: &BinlogIssue) -> usize {
     if !issue.message.is_empty() && issue.message != "Build issue" {
         score += 1;
     }
-
     score
 }
 
@@ -489,20 +483,22 @@ fn read_deduplicated_string(
     parsed: &ParsedBinlog,
 ) -> Result<Option<String>> {
     let index = reader.read_7bit_i32()?;
-    match index {
-        0 => Ok(None),
-        1 => Ok(Some(String::new())),
-        i if i >= STRING_RECORD_START_INDEX => {
-            let record_idx = (i - STRING_RECORD_START_INDEX) as usize;
-            parsed
-                .string_records
-                .get(record_idx)
-                .cloned()
-                .map(Some)
-                .with_context(|| format!("invalid string record index {}", i))
-        }
-        _ => Ok(None),
+    if index == 0 {
+        return Ok(None);
     }
+    if index == 1 {
+        return Ok(Some(String::new()));
+    }
+    if index < STRING_RECORD_START_INDEX {
+        return Ok(None);
+    }
+    let record_idx = (index - STRING_RECORD_START_INDEX) as usize;
+    parsed
+        .string_records
+        .get(record_idx)
+        .cloned()
+        .map(Some)
+        .with_context(|| format!("invalid string record index {}", index))
 }
 
 fn format_ticks_duration(ticks: i64) -> String {
