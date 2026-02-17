@@ -119,8 +119,19 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
             format_test_output(&summary, &binlog_path)
         }
         "restore" => {
-            let summary = binlog::parse_restore(&binlog_path)?;
-            format_restore_output(&summary, &binlog_path)
+            let binlog_summary = normalize_restore_summary(
+                binlog::parse_restore(&binlog_path)?,
+                output.status.success(),
+            );
+            let raw_summary = normalize_restore_summary(
+                binlog::parse_restore_from_text(&raw),
+                output.status.success(),
+            );
+            let summary = merge_restore_summaries(binlog_summary, raw_summary);
+
+            let (raw_errors, raw_warnings) = binlog::parse_restore_issues_from_text(&raw);
+
+            format_restore_output(&summary, &raw_errors, &raw_warnings, &binlog_path)
         }
         _ => raw.clone(),
     };
@@ -365,6 +376,37 @@ fn normalize_test_summary(
     summary
 }
 
+fn normalize_restore_summary(
+    mut summary: binlog::RestoreSummary,
+    command_success: bool,
+) -> binlog::RestoreSummary {
+    if !command_success && summary.errors == 0 {
+        summary.errors = 1;
+    }
+
+    summary
+}
+
+fn merge_restore_summaries(
+    mut binlog_summary: binlog::RestoreSummary,
+    raw_summary: binlog::RestoreSummary,
+) -> binlog::RestoreSummary {
+    if binlog_summary.restored_projects == 0 {
+        binlog_summary.restored_projects = raw_summary.restored_projects;
+    }
+    if raw_summary.errors > binlog_summary.errors {
+        binlog_summary.errors = raw_summary.errors;
+    }
+    if raw_summary.warnings > binlog_summary.warnings {
+        binlog_summary.warnings = raw_summary.warnings;
+    }
+    if binlog_summary.duration_text.is_none() {
+        binlog_summary.duration_text = raw_summary.duration_text;
+    }
+
+    binlog_summary
+}
+
 fn format_issue(issue: &binlog::BinlogIssue, kind: &str) -> String {
     if issue.file.is_empty() {
         return format!("  {} {}", kind, truncate(&issue.message, 180));
@@ -477,7 +519,12 @@ fn format_test_output(summary: &binlog::TestSummary, binlog_path: &Path) -> Stri
     out
 }
 
-fn format_restore_output(summary: &binlog::RestoreSummary, binlog_path: &Path) -> String {
+fn format_restore_output(
+    summary: &binlog::RestoreSummary,
+    errors: &[binlog::BinlogIssue],
+    warnings: &[binlog::BinlogIssue],
+    binlog_path: &Path,
+) -> String {
     let has_errors = summary.errors > 0;
     let status_icon = if has_errors { "fail" } else { "ok" };
     let duration = summary.duration_text.as_deref().unwrap_or("unknown");
@@ -486,6 +533,27 @@ fn format_restore_output(summary: &binlog::RestoreSummary, binlog_path: &Path) -
         "{} dotnet restore: {} projects, {} errors, {} warnings ({})",
         status_icon, summary.restored_projects, summary.errors, summary.warnings, duration
     );
+
+    if !errors.is_empty() {
+        out.push_str("\n---------------------------------------\n\nErrors:\n");
+        for issue in errors.iter().take(20) {
+            out.push_str(&format!("{}\n", format_issue(issue, "error")));
+        }
+        if errors.len() > 20 {
+            out.push_str(&format!("  ... +{} more errors\n", errors.len() - 20));
+        }
+    }
+
+    if !warnings.is_empty() {
+        out.push_str("\nWarnings:\n");
+        for issue in warnings.iter().take(10) {
+            out.push_str(&format!("{}\n", format_issue(issue, "warning")));
+        }
+        if warnings.len() > 10 {
+            out.push_str(&format!("  ... +{} more warnings\n", warnings.len() - 10));
+        }
+    }
+
     out.push_str(&format!("\nBinlog: {}", binlog_path.display()));
     out
 }
@@ -591,10 +659,48 @@ mod tests {
             duration_text: Some("00:00:01.10".to_string()),
         };
 
-        let output = format_restore_output(&summary, Path::new("/tmp/restore.binlog"));
+        let output = format_restore_output(&summary, &[], &[], Path::new("/tmp/restore.binlog"));
         assert!(output.starts_with("ok dotnet restore"));
         assert!(output.contains("3 projects"));
         assert!(output.contains("1 warnings"));
+    }
+
+    #[test]
+    fn test_format_restore_output_failure() {
+        let summary = binlog::RestoreSummary {
+            restored_projects: 2,
+            warnings: 0,
+            errors: 1,
+            duration_text: Some("00:00:01.00".to_string()),
+        };
+
+        let output = format_restore_output(&summary, &[], &[], Path::new("/tmp/restore.binlog"));
+        assert!(output.starts_with("fail dotnet restore"));
+        assert!(output.contains("1 errors"));
+    }
+
+    #[test]
+    fn test_format_restore_output_includes_error_details() {
+        let summary = binlog::RestoreSummary {
+            restored_projects: 2,
+            warnings: 0,
+            errors: 1,
+            duration_text: Some("00:00:01.00".to_string()),
+        };
+
+        let issues = vec![binlog::BinlogIssue {
+            code: "NU1101".to_string(),
+            file: "/repo/src/App/App.csproj".to_string(),
+            line: 0,
+            column: 0,
+            message: "Unable to find package Foo.Bar".to_string(),
+        }];
+
+        let output =
+            format_restore_output(&summary, &issues, &[], Path::new("/tmp/restore.binlog"));
+        assert!(output.contains("Errors:"));
+        assert!(output.contains("error NU1101"));
+        assert!(output.contains("Unable to find package Foo.Bar"));
     }
 
     #[test]
@@ -723,6 +829,40 @@ mod tests {
         let normalized = normalize_test_summary(summary, false);
         assert_eq!(normalized.failed, 1);
         assert_eq!(normalized.total, 1);
+    }
+
+    #[test]
+    fn test_normalize_restore_summary_sets_error_floor_on_failed_command() {
+        let summary = binlog::RestoreSummary {
+            restored_projects: 2,
+            warnings: 0,
+            errors: 0,
+            duration_text: None,
+        };
+
+        let normalized = normalize_restore_summary(summary, false);
+        assert_eq!(normalized.errors, 1);
+    }
+
+    #[test]
+    fn test_merge_restore_summaries_prefers_raw_error_count() {
+        let binlog_summary = binlog::RestoreSummary {
+            restored_projects: 2,
+            warnings: 0,
+            errors: 0,
+            duration_text: Some("unknown".to_string()),
+        };
+
+        let raw_summary = binlog::RestoreSummary {
+            restored_projects: 0,
+            warnings: 0,
+            errors: 1,
+            duration_text: Some("unknown".to_string()),
+        };
+
+        let merged = merge_restore_summaries(binlog_summary, raw_summary);
+        assert_eq!(merged.errors, 1);
+        assert_eq!(merged.restored_projects, 2);
     }
 
     #[test]

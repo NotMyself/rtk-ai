@@ -66,8 +66,10 @@ lazy_static! {
         Regex::new(r"(?m)^\s*Failed\s+(?P<name>[^\r\n\[]+)").expect("valid regex");
     static ref RESTORE_PROJECT_RE: Regex =
         Regex::new(r"(?m)^\s*Restored\s+.+\.csproj\s*\(").expect("valid regex");
-    static ref WARNING_COUNT_RE: Regex = Regex::new(r"(?m)^\s*warning\s+").expect("valid regex");
-    static ref ERROR_COUNT_RE: Regex = Regex::new(r"(?m)^\s*error\s+").expect("valid regex");
+    static ref RESTORE_DIAGNOSTIC_RE: Regex = Regex::new(
+        r"(?mi)^\s*(?:(?P<file>.+?)\s+:\s+)?(?P<kind>warning|error)\s+(?P<code>[A-Za-z]{2,}\d{3,})\s*:\s*(?P<msg>.+)$"
+    )
+    .expect("valid regex");
     static ref PROJECT_PATH_RE: Regex =
         Regex::new(r"(?m)^\s*([A-Za-z]:)?[^\r\n]*\.csproj(?:\s|$)").expect("valid regex");
     static ref PRINTABLE_RUN_RE: Regex = Regex::new(r"[\x20-\x7E]{5,}").expect("valid regex");
@@ -810,13 +812,69 @@ pub fn parse_test_from_text(text: &str) -> TestSummary {
 }
 
 pub fn parse_restore_from_text(text: &str) -> RestoreSummary {
+    let (errors, warnings) = parse_restore_issues_from_text(text);
     let scrubbed = scrub_sensitive_env_vars(text);
+
     RestoreSummary {
         restored_projects: RESTORE_PROJECT_RE.captures_iter(&scrubbed).count(),
-        warnings: WARNING_COUNT_RE.captures_iter(&scrubbed).count(),
-        errors: ERROR_COUNT_RE.captures_iter(&scrubbed).count(),
+        warnings: warnings.len(),
+        errors: errors.len(),
         duration_text: extract_duration(&scrubbed),
     }
+}
+
+pub fn parse_restore_issues_from_text(text: &str) -> (Vec<BinlogIssue>, Vec<BinlogIssue>) {
+    let scrubbed = scrub_sensitive_env_vars(text);
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen_errors: HashSet<(String, String, u32, u32, String)> = HashSet::new();
+    let mut seen_warnings: HashSet<(String, String, u32, u32, String)> = HashSet::new();
+
+    for captures in RESTORE_DIAGNOSTIC_RE.captures_iter(&scrubbed) {
+        let issue = BinlogIssue {
+            code: captures
+                .name("code")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
+            file: captures
+                .name("file")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
+            line: 0,
+            column: 0,
+            message: captures
+                .name("msg")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
+        };
+
+        let key = (
+            issue.code.clone(),
+            issue.file.clone(),
+            issue.line,
+            issue.column,
+            issue.message.clone(),
+        );
+
+        match captures
+            .name("kind")
+            .map(|m| m.as_str().to_ascii_lowercase())
+        {
+            Some(kind) if kind == "error" => {
+                if seen_errors.insert(key) {
+                    errors.push(issue);
+                }
+            }
+            Some(kind) if kind == "warning" => {
+                if seen_warnings.insert(key) {
+                    warnings.push(issue);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (errors, warnings)
 }
 
 fn count_projects(text: &str) -> usize {
@@ -1019,6 +1077,33 @@ Failed!  - Failed:     2, Passed:   245, Skipped:     0, Total:   247, Duration:
         let summary = parse_restore_from_text(input);
         assert_eq!(summary.restored_projects, 2);
         assert_eq!(summary.errors, 0);
+    }
+
+    #[test]
+    fn test_parse_restore_from_text_extracts_nuget_error_diagnostic() {
+        let input = r#"
+/Users/dev/src/App/App.csproj : error NU1101: Unable to find package Foo.Bar. No packages exist with this id in source(s): nuget.org
+
+Restore failed with 1 error(s) in 1.0s
+"#;
+
+        let summary = parse_restore_from_text(input);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.warnings, 0);
+    }
+
+    #[test]
+    fn test_parse_restore_issues_ignores_summary_warning_error_counts() {
+        let input = r#"
+  0 Warning(s)
+  1 Error(s)
+
+  Time Elapsed 00:00:01.23
+"#;
+
+        let (errors, warnings) = parse_restore_issues_from_text(input);
+        assert_eq!(errors.len(), 0);
+        assert_eq!(warnings.len(), 0);
     }
 
     #[test]
