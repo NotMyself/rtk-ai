@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DOTNET_CLI_UI_LANGUAGE: &str = "DOTNET_CLI_UI_LANGUAGE";
+const DOTNET_CLI_UI_LANGUAGE_VALUE: &str = "en-US";
+
 pub fn run_build(args: &[String], verbose: u8) -> Result<()> {
     run_dotnet_with_binlog("build", args, verbose)
 }
@@ -29,6 +32,7 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<()> {
     let subcommand = args[0].to_string_lossy().to_string();
 
     let mut cmd = Command::new("dotnet");
+    cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg(&subcommand);
     for arg in &args[1..] {
         cmd.arg(arg);
@@ -76,6 +80,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     };
 
     let mut cmd = Command::new("dotnet");
+    cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg(subcommand);
 
     for arg in build_effective_dotnet_args(subcommand, args, &binlog_path, trx_path.as_deref()) {
