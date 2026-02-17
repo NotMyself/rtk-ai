@@ -51,19 +51,31 @@ pub struct RestoreSummary {
 
 lazy_static! {
     static ref ISSUE_RE: Regex = Regex::new(
-        r"(?m)^\s*(?P<file>[^\r\n:(]+)\((?P<line>\d+),(?P<column>\d+)\):\s*(?P<kind>error|warning)\s*(?P<code>[A-Za-z]+\d+):\s*(?P<msg>.+)$"
+        r"(?m)^\s*(?P<file>[^\r\n:(]+)\((?P<line>\d+),(?P<column>\d+)\):\s*(?P<kind>error|warning)\s*(?:(?P<code>[A-Za-z]+\d+)\s*:\s*)?(?P<msg>.*)$"
     )
     .expect("valid regex");
-    static ref BUILD_SUMMARY_RE: Regex = Regex::new(r"(?m)^\s*(?P<count>\d+)\s+(?P<kind>Warning|Error)\(s\)")
+    static ref BUILD_SUMMARY_RE: Regex = Regex::new(r"(?mi)^\s*(?P<count>\d+)\s+(?P<kind>warning|error)\(s\)")
         .expect("valid regex");
+    static ref ERROR_COUNT_RE: Regex =
+        Regex::new(r"(?i)\b(?P<count>\d+)\s+error\(s\)").expect("valid regex");
+    static ref WARNING_COUNT_RE: Regex =
+        Regex::new(r"(?i)\b(?P<count>\d+)\s+warning\(s\)").expect("valid regex");
+    static ref FALLBACK_ERROR_LINE_RE: Regex =
+        Regex::new(r"(?mi)^.+\(\d+,\d+\):\s*error(?:\s+[A-Za-z]{2,}\d{3,})?(?:\s*:.*)?$")
+            .expect("valid regex");
+    static ref FALLBACK_WARNING_LINE_RE: Regex =
+        Regex::new(r"(?mi)^.+\(\d+,\d+\):\s*warning(?:\s+[A-Za-z]{2,}\d{3,})?(?:\s*:.*)?$")
+            .expect("valid regex");
     static ref DURATION_RE: Regex =
         Regex::new(r"(?m)^\s*Time Elapsed\s+(?P<duration>[^\r\n]+)$").expect("valid regex");
     static ref TEST_RESULT_RE: Regex = Regex::new(
         r"(?m)(?:Passed!|Failed!)\s*-\s*Failed:\s*(?P<failed>\d+),\s*Passed:\s*(?P<passed>\d+),\s*Skipped:\s*(?P<skipped>\d+),\s*Total:\s*(?P<total>\d+),\s*Duration:\s*(?P<duration>[^\r\n-]+)"
     )
     .expect("valid regex");
-    static ref FAILED_TEST_HEAD_RE: Regex =
-        Regex::new(r"(?m)^\s*Failed\s+(?P<name>[^\r\n\[]+)").expect("valid regex");
+    static ref FAILED_TEST_HEAD_RE: Regex = Regex::new(
+        r"(?m)^\s*Failed\s+(?P<name>[^\r\n\[]+)\s+\[[^\]\r\n]+\]\s*$"
+    )
+    .expect("valid regex");
     static ref RESTORE_PROJECT_RE: Regex =
         Regex::new(r"(?m)^\s*Restored\s+.+\.csproj\s*\(").expect("valid regex");
     static ref RESTORE_DIAGNOSTIC_RE: Regex = Regex::new(
@@ -634,7 +646,14 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
                 .unwrap_or(0),
             message: captures
                 .name("msg")
-                .map(|m| m.as_str().trim().to_string())
+                .map(|m| {
+                    let msg = m.as_str().trim();
+                    if msg.is_empty() {
+                        "diagnostic without message".to_string()
+                    } else {
+                        msg.to_string()
+                    }
+                })
                 .unwrap_or_default(),
         };
 
@@ -662,8 +681,8 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
     }
 
     if summary.errors.is_empty() || summary.warnings.is_empty() {
-        let mut warning_count_from_summary = None;
-        let mut error_count_from_summary = None;
+        let mut warning_count_from_summary = 0;
+        let mut error_count_from_summary = 0;
 
         for captures in BUILD_SUMMARY_RE.captures_iter(&scrubbed) {
             let count = captures
@@ -671,15 +690,43 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
                 .and_then(|m| m.as_str().parse::<usize>().ok())
                 .unwrap_or(0);
 
-            match captures.name("kind").map(|m| m.as_str()) {
-                Some("Warning") => warning_count_from_summary = Some(count),
-                Some("Error") => error_count_from_summary = Some(count),
+            match captures
+                .name("kind")
+                .map(|m| m.as_str().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("warning") => {
+                    warning_count_from_summary = warning_count_from_summary.max(count)
+                }
+                Some("error") => error_count_from_summary = error_count_from_summary.max(count),
                 _ => {}
             }
         }
 
+        let inline_error_count = ERROR_COUNT_RE
+            .captures_iter(&scrubbed)
+            .filter_map(|captures| {
+                captures
+                    .name("count")
+                    .and_then(|m| m.as_str().parse::<usize>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        let inline_warning_count = WARNING_COUNT_RE
+            .captures_iter(&scrubbed)
+            .filter_map(|captures| {
+                captures
+                    .name("count")
+                    .and_then(|m| m.as_str().parse::<usize>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+
+        warning_count_from_summary = warning_count_from_summary.max(inline_warning_count);
+        error_count_from_summary = error_count_from_summary.max(inline_error_count);
+
         if summary.errors.is_empty() {
-            for idx in 0..error_count_from_summary.unwrap_or(0) {
+            for idx in 0..error_count_from_summary {
                 summary.errors.push(BinlogIssue {
                     code: String::new(),
                     file: String::new(),
@@ -691,7 +738,33 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
         }
 
         if summary.warnings.is_empty() {
-            for idx in 0..warning_count_from_summary.unwrap_or(0) {
+            for idx in 0..warning_count_from_summary {
+                summary.warnings.push(BinlogIssue {
+                    code: String::new(),
+                    file: String::new(),
+                    line: 0,
+                    column: 0,
+                    message: format!("Build warning #{} (details omitted)", idx + 1),
+                });
+            }
+        }
+
+        if summary.errors.is_empty() {
+            let fallback_error_lines = FALLBACK_ERROR_LINE_RE.captures_iter(&scrubbed).count();
+            for idx in 0..fallback_error_lines {
+                summary.errors.push(BinlogIssue {
+                    code: String::new(),
+                    file: String::new(),
+                    line: 0,
+                    column: 0,
+                    message: format!("Build error #{} (details omitted)", idx + 1),
+                });
+            }
+        }
+
+        if summary.warnings.is_empty() {
+            let fallback_warning_lines = FALLBACK_WARNING_LINE_RE.captures_iter(&scrubbed).count();
+            for idx in 0..fallback_warning_lines {
                 summary.warnings.push(BinlogIssue {
                     code: String::new(),
                     file: String::new(),
@@ -706,7 +779,13 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
     let has_error_signal = scrubbed.contains("Build FAILED")
         || scrubbed.contains(": error ")
         || BUILD_SUMMARY_RE.captures_iter(&scrubbed).any(|captures| {
-            let is_error = matches!(captures.name("kind").map(|m| m.as_str()), Some("Error"));
+            let is_error = matches!(
+                captures
+                    .name("kind")
+                    .map(|m| m.as_str().to_ascii_lowercase())
+                    .as_deref(),
+                Some("error")
+            );
             let count = captures
                 .name("count")
                 .and_then(|m| m.as_str().parse::<usize>().ok())
@@ -776,22 +855,28 @@ pub fn parse_test_from_text(text: &str) -> TestSummary {
             idx += 1;
             while idx < lines.len() {
                 let detail_line = lines[idx].trim_end();
-                if detail_line.trim().is_empty() {
-                    break;
-                }
                 if FAILED_TEST_HEAD_RE.is_match(detail_line) {
                     idx = idx.saturating_sub(1);
                     break;
                 }
-                if detail_line.trim_start().starts_with("Failed ")
-                    || detail_line.trim_start().starts_with("Passed ")
+                let detail_trimmed = detail_line.trim_start();
+                if detail_trimmed.starts_with("Failed!  -")
+                    || detail_trimmed.starts_with("Passed!  -")
+                    || detail_trimmed.starts_with("Test summary:")
+                    || detail_trimmed.starts_with("Build ")
                 {
                     idx = idx.saturating_sub(1);
                     break;
                 }
 
-                details.push(detail_line.trim().to_string());
-                if details.len() >= 4 {
+                if detail_line.trim().is_empty() {
+                    if !details.is_empty() {
+                        details.push(String::new());
+                    }
+                } else {
+                    details.push(detail_line.trim().to_string());
+                }
+                if details.len() >= 20 {
                     break;
                 }
                 idx += 1;
@@ -1045,6 +1130,33 @@ Time Elapsed 00:00:03.45
     }
 
     #[test]
+    fn test_parse_build_from_text_extracts_warning_without_code() {
+        let input = r#"
+/Users/dev/sdk/Microsoft.TestPlatform.targets(48,5): warning
+Build succeeded with 1 warning(s) in 0.5s
+"#;
+
+        let summary = parse_build_from_text(input);
+        assert_eq!(summary.warnings.len(), 1);
+        assert_eq!(
+            summary.warnings[0].file,
+            "/Users/dev/sdk/Microsoft.TestPlatform.targets"
+        );
+        assert_eq!(summary.warnings[0].code, "");
+    }
+
+    #[test]
+    fn test_parse_build_from_text_extracts_inline_warning_counts() {
+        let input = r#"
+Build failed with 1 error(s) and 4 warning(s) in 4.7s
+"#;
+
+        let summary = parse_build_from_text(input);
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(summary.warnings.len(), 4);
+    }
+
+    #[test]
     fn test_parse_test_from_text_extracts_failure_summary() {
         let input = r#"
 Failed!  - Failed:     2, Passed:   245, Skipped:     0, Total:   247, Duration: 1 s
@@ -1065,6 +1177,41 @@ Failed!  - Failed:     2, Passed:   245, Skipped:     0, Total:   247, Duration:
         assert!(summary.failed_tests[0]
             .name
             .contains("CalculatorTests.Add_ShouldReturnSum"));
+    }
+
+    #[test]
+    fn test_parse_test_from_text_keeps_multiline_failure_details() {
+        let input = r#"
+Failed!  - Failed:     1, Passed:   10, Skipped:     0, Total:   11, Duration: 1 s
+  Failed MyApp.Tests.SampleTests.ShouldFail [5 ms]
+  Error Message:
+   Assert.That(messageInstance, Is.Null)
+   Expected: null
+   But was:  <MyApp.Tests.SampleTests+Impl>
+
+   Stack Trace:
+      at MyApp.Tests.SampleTests.ShouldFail() in /repo/SampleTests.cs:line 42
+"#;
+
+        let summary = parse_test_from_text(input);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failed_tests.len(), 1);
+        let details = summary.failed_tests[0].details.join("\n");
+        assert!(details.contains("Expected: null"));
+        assert!(details.contains("But was:"));
+        assert!(details.contains("Stack Trace:"));
+    }
+
+    #[test]
+    fn test_parse_test_from_text_ignores_non_test_failed_prefix_lines() {
+        let input = r#"
+Passed!  - Failed:     0, Passed:   940, Skipped:     7, Total:   947, Duration: 1 s
+  Failed to load prune package data from PrunePackageData folder, loading from targeting packs instead
+"#;
+
+        let summary = parse_test_from_text(input);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.failed_tests.is_empty());
     }
 
     #[test]

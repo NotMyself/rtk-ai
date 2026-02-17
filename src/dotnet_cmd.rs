@@ -66,6 +66,7 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<()> {
 fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
     let binlog_path = build_binlog_path(subcommand);
+    let should_expect_binlog = subcommand != "test" || has_binlog_arg(args);
 
     // For test commands, also create a TRX file for detailed results
     let trx_path = if subcommand == "test" {
@@ -108,15 +109,39 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         }
         "test" => {
             // First try to parse from binlog/console output
-            let parsed_summary = binlog::parse_test(&binlog_path)?;
+            let parsed_summary = if should_expect_binlog && binlog_path.exists() {
+                binlog::parse_test(&binlog_path).unwrap_or_default()
+            } else {
+                binlog::TestSummary::default()
+            };
+            let raw_summary = binlog::parse_test_from_text(&raw);
+            let merged_summary = merge_test_summaries(parsed_summary, raw_summary);
             let summary = maybe_fill_test_summary_from_trx(
-                parsed_summary,
+                merged_summary,
                 trx_path.as_deref(),
                 dotnet_trx::find_recent_trx_in_testresults(),
             );
 
             let summary = normalize_test_summary(summary, output.status.success());
-            format_test_output(&summary, &binlog_path)
+            let binlog_diagnostics = if should_expect_binlog && binlog_path.exists() {
+                normalize_build_summary(
+                    binlog::parse_build(&binlog_path).unwrap_or_default(),
+                    output.status.success(),
+                )
+            } else {
+                binlog::BuildSummary::default()
+            };
+            let raw_diagnostics = normalize_build_summary(
+                binlog::parse_build_from_text(&raw),
+                output.status.success(),
+            );
+            let test_build_summary = merge_build_summaries(binlog_diagnostics, raw_diagnostics);
+            format_test_output(
+                &summary,
+                &test_build_summary.errors,
+                &test_build_summary.warnings,
+                &binlog_path,
+            )
         }
         "restore" => {
             let binlog_summary = normalize_restore_summary(
@@ -212,11 +237,11 @@ fn build_effective_dotnet_args(
 ) -> Vec<String> {
     let mut effective = Vec::new();
 
-    if !has_binlog_arg(args) {
+    if subcommand != "test" && !has_binlog_arg(args) {
         effective.push(format!("-bl:{}", binlog_path.display()));
     }
 
-    if !has_verbosity_arg(args) {
+    if subcommand != "test" && !has_verbosity_arg(args) {
         effective.push("-v:minimal".to_string());
     }
 
@@ -227,7 +252,7 @@ fn build_effective_dotnet_args(
     if subcommand == "test" && !has_logger_arg(args) {
         if let Some(trx) = trx_path {
             effective.push("--logger".to_string());
-            effective.push(format!("trx;LogFileName=\"{}\"", trx.display()));
+            effective.push(format!("trx;LogFileName={}", trx.display()));
         }
     }
 
@@ -376,6 +401,32 @@ fn normalize_test_summary(
     summary
 }
 
+fn merge_test_summaries(
+    mut binlog_summary: binlog::TestSummary,
+    raw_summary: binlog::TestSummary,
+) -> binlog::TestSummary {
+    if raw_summary.total > 0 {
+        binlog_summary.passed = raw_summary.passed;
+        binlog_summary.failed = raw_summary.failed;
+        binlog_summary.skipped = raw_summary.skipped;
+        binlog_summary.total = raw_summary.total;
+    }
+
+    if !raw_summary.failed_tests.is_empty() {
+        binlog_summary.failed_tests = raw_summary.failed_tests;
+    }
+
+    if binlog_summary.project_count == 0 {
+        binlog_summary.project_count = raw_summary.project_count;
+    }
+
+    if binlog_summary.duration_text.is_none() {
+        binlog_summary.duration_text = raw_summary.duration_text;
+    }
+
+    binlog_summary
+}
+
 fn normalize_restore_summary(
     mut summary: binlog::RestoreSummary,
     command_success: bool,
@@ -410,6 +461,17 @@ fn merge_restore_summaries(
 fn format_issue(issue: &binlog::BinlogIssue, kind: &str) -> String {
     if issue.file.is_empty() {
         return format!("  {} {}", kind, truncate(&issue.message, 180));
+    }
+
+    if issue.code.is_empty() {
+        return format!(
+            "  {}({},{}) {}: {}",
+            issue.file,
+            issue.line,
+            issue.column,
+            kind,
+            truncate(&issue.message, 180)
+        );
     }
 
     format!(
@@ -466,10 +528,16 @@ fn format_build_output(summary: &binlog::BuildSummary, binlog_path: &Path) -> St
     out
 }
 
-fn format_test_output(summary: &binlog::TestSummary, binlog_path: &Path) -> String {
+fn format_test_output(
+    summary: &binlog::TestSummary,
+    errors: &[binlog::BinlogIssue],
+    warnings: &[binlog::BinlogIssue],
+    binlog_path: &Path,
+) -> String {
     let has_failures = summary.failed > 0 || !summary.failed_tests.is_empty();
     let status_icon = if has_failures { "fail" } else { "ok" };
     let duration = summary.duration_text.as_deref().unwrap_or("unknown");
+    let warning_count = warnings.len();
     let counts_unavailable = summary.passed == 0
         && summary.failed == 0
         && summary.skipped == 0
@@ -478,23 +546,24 @@ fn format_test_output(summary: &binlog::TestSummary, binlog_path: &Path) -> Stri
 
     let mut out = if counts_unavailable {
         format!(
-            "{} dotnet test: completed (binlog-only mode, counts unavailable) ({})",
-            status_icon, duration
+            "{} dotnet test: completed (binlog-only mode, counts unavailable, {} warnings) ({})",
+            status_icon, warning_count, duration
         )
     } else if has_failures {
         format!(
-            "{} dotnet test: {} passed, {} failed, {} skipped in {} projects ({})",
+            "{} dotnet test: {} passed, {} failed, {} skipped, {} warnings in {} projects ({})",
             status_icon,
             summary.passed,
             summary.failed,
             summary.skipped,
+            warning_count,
             summary.project_count,
             duration
         )
     } else {
         format!(
-            "{} dotnet test: {} tests passed in {} projects ({})",
-            status_icon, summary.passed, summary.project_count, duration
+            "{} dotnet test: {} tests passed, {} warnings in {} projects ({})",
+            status_icon, summary.passed, warning_count, summary.project_count, duration
         )
     };
 
@@ -503,7 +572,7 @@ fn format_test_output(summary: &binlog::TestSummary, binlog_path: &Path) -> Stri
         for failed in summary.failed_tests.iter().take(15) {
             out.push_str(&format!("  {}\n", failed.name));
             for detail in &failed.details {
-                out.push_str(&format!("    {}\n", truncate(detail, 180)));
+                out.push_str(&format!("    {}\n", truncate(detail, 320)));
             }
             out.push('\n');
         }
@@ -512,6 +581,26 @@ fn format_test_output(summary: &binlog::TestSummary, binlog_path: &Path) -> Stri
                 "... +{} more failed tests\n",
                 summary.failed_tests.len() - 15
             ));
+        }
+    }
+
+    if !errors.is_empty() {
+        out.push_str("\nErrors:\n");
+        for issue in errors.iter().take(10) {
+            out.push_str(&format!("{}\n", format_issue(issue, "error")));
+        }
+        if errors.len() > 10 {
+            out.push_str(&format!("  ... +{} more errors\n", errors.len() - 10));
+        }
+    }
+
+    if !warnings.is_empty() {
+        out.push_str("\nWarnings:\n");
+        for issue in warnings.iter().take(10) {
+            out.push_str(&format!("{}\n", format_issue(issue, "warning")));
+        }
+        if warnings.len() > 10 {
+            out.push_str(&format!("  ... +{} more warnings\n", warnings.len() - 10));
         }
     }
 
@@ -645,9 +734,64 @@ mod tests {
             duration_text: Some("1 s".to_string()),
         };
 
-        let output = format_test_output(&summary, Path::new("/tmp/test.binlog"));
+        let output = format_test_output(&summary, &[], &[], Path::new("/tmp/test.binlog"));
         assert!(output.contains("10 passed, 1 failed"));
         assert!(output.contains("MyTests.ShouldFail"));
+    }
+
+    #[test]
+    fn test_format_test_output_surfaces_warnings() {
+        let summary = binlog::TestSummary {
+            passed: 940,
+            failed: 0,
+            skipped: 7,
+            total: 947,
+            project_count: 1,
+            failed_tests: Vec::new(),
+            duration_text: Some("1 s".to_string()),
+        };
+
+        let warnings = vec![binlog::BinlogIssue {
+            code: String::new(),
+            file: "/sdk/Microsoft.TestPlatform.targets".to_string(),
+            line: 48,
+            column: 5,
+            message: "Violators:".to_string(),
+        }];
+
+        let output = format_test_output(&summary, &[], &warnings, Path::new("/tmp/test.binlog"));
+        assert!(output.contains("940 tests passed, 1 warnings"));
+        assert!(output.contains("Warnings:"));
+        assert!(output.contains("Microsoft.TestPlatform.targets"));
+    }
+
+    #[test]
+    fn test_format_test_output_surfaces_errors() {
+        let summary = binlog::TestSummary {
+            passed: 939,
+            failed: 1,
+            skipped: 7,
+            total: 947,
+            project_count: 1,
+            failed_tests: Vec::new(),
+            duration_text: Some("1 s".to_string()),
+        };
+
+        let errors = vec![binlog::BinlogIssue {
+            code: "TESTERROR".to_string(),
+            file: "/repo/MessageMapperTests.cs".to_string(),
+            line: 135,
+            column: 0,
+            message: "CreateInstance_should_initialize_interface_message_type_on_demand"
+                .to_string(),
+        }];
+
+        let output = format_test_output(&summary, &errors, &[], Path::new("/tmp/test.binlog"));
+        assert!(output.contains("Errors:"));
+        assert!(output.contains("error TESTERROR"));
+        assert!(
+            output.contains("CreateInstance_should_initialize_interface_message_type_on_demand")
+        );
     }
 
     #[test]
@@ -715,7 +859,7 @@ mod tests {
             duration_text: Some("unknown".to_string()),
         };
 
-        let output = format_test_output(&summary, Path::new("/tmp/test.binlog"));
+        let output = format_test_output(&summary, &[], &[], Path::new("/tmp/test.binlog"));
         assert!(output.contains("counts unavailable"));
     }
 
@@ -829,6 +973,41 @@ mod tests {
         let normalized = normalize_test_summary(summary, false);
         assert_eq!(normalized.failed, 1);
         assert_eq!(normalized.total, 1);
+    }
+
+    #[test]
+    fn test_merge_test_summaries_prefers_raw_counts_and_failed_tests() {
+        let binlog_summary = binlog::TestSummary {
+            passed: 939,
+            failed: 1,
+            skipped: 8,
+            total: 948,
+            project_count: 1,
+            failed_tests: Vec::new(),
+            duration_text: Some("unknown".to_string()),
+        };
+
+        let raw_summary = binlog::TestSummary {
+            passed: 939,
+            failed: 1,
+            skipped: 7,
+            total: 947,
+            project_count: 0,
+            failed_tests: vec![binlog::FailedTest {
+                name: "MessageMapperTests.CreateInstance_should_initialize_interface_message_type_on_demand"
+                    .to_string(),
+                details: vec!["Assert.That(messageInstance, Is.Null)".to_string()],
+            }],
+            duration_text: Some("1 s".to_string()),
+        };
+
+        let merged = merge_test_summaries(binlog_summary, raw_summary);
+        assert_eq!(merged.skipped, 7);
+        assert_eq!(merged.total, 947);
+        assert_eq!(merged.failed_tests.len(), 1);
+        assert!(merged.failed_tests[0]
+            .name
+            .contains("CreateInstance_should_initialize"));
     }
 
     #[test]
@@ -956,6 +1135,14 @@ mod tests {
     }
 
     #[test]
+    fn test_test_subcommand_does_not_inject_minimal_verbosity_by_default() {
+        let args = Vec::<String>::new();
+
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        assert!(!injected.contains(&"-v:minimal".to_string()));
+    }
+
+    #[test]
     fn test_user_logger_override() {
         let args = vec![
             "--logger".to_string(),
@@ -969,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trx_logger_path_is_quoted_when_path_contains_spaces() {
+    fn test_trx_logger_path_uses_raw_value_with_spaces() {
         let args = Vec::<String>::new();
 
         let injected = build_dotnet_args_for_test("test", &args, true);
@@ -978,7 +1165,8 @@ mod tests {
             .find(|a| a.starts_with("trx;LogFileName="))
             .expect("trx logger argument exists");
 
-        assert!(trx_arg.contains("LogFileName=\"/tmp/test results/test.trx\""));
+        assert!(trx_arg.contains("LogFileName=/tmp/test results/test.trx"));
+        assert!(!trx_arg.contains('"'));
     }
 
     #[test]
