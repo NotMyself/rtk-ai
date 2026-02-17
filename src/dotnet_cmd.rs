@@ -306,9 +306,12 @@ fn merge_build_summaries(
     mut binlog_summary: binlog::BuildSummary,
     raw_summary: binlog::BuildSummary,
 ) -> binlog::BuildSummary {
-    binlog_summary.errors = select_preferred_issues(binlog_summary.errors, raw_summary.errors);
-    binlog_summary.warnings =
-        select_preferred_issues(binlog_summary.warnings, raw_summary.warnings);
+    if binlog_summary.errors.is_empty() {
+        binlog_summary.errors = raw_summary.errors;
+    }
+    if binlog_summary.warnings.is_empty() {
+        binlog_summary.warnings = raw_summary.warnings;
+    }
 
     if binlog_summary.project_count == 0 {
         binlog_summary.project_count = raw_summary.project_count;
@@ -318,69 +321,6 @@ fn merge_build_summaries(
     }
 
     binlog_summary
-}
-
-fn select_preferred_issues(
-    binlog_issues: Vec<binlog::BinlogIssue>,
-    raw_issues: Vec<binlog::BinlogIssue>,
-) -> Vec<binlog::BinlogIssue> {
-    if binlog_issues.is_empty() {
-        return raw_issues;
-    }
-    if raw_issues.is_empty() {
-        return binlog_issues;
-    }
-
-    let binlog_score = issues_quality_score(&binlog_issues);
-    let raw_score = issues_quality_score(&raw_issues);
-
-    if raw_score > binlog_score
-        || (raw_score == binlog_score && raw_issues.len() > binlog_issues.len())
-    {
-        raw_issues
-    } else {
-        binlog_issues
-    }
-}
-
-fn issues_quality_score(issues: &[binlog::BinlogIssue]) -> usize {
-    issues.iter().map(issue_quality_score).sum()
-}
-
-fn issue_quality_score(issue: &binlog::BinlogIssue) -> usize {
-    let mut score = 0;
-
-    if !issue.file.is_empty() && !looks_like_diagnostic_token(&issue.file) {
-        score += 4;
-    }
-    if !issue.code.is_empty() {
-        score += 2;
-    }
-    if issue.line > 0 {
-        score += 1;
-    }
-    if issue.column > 0 {
-        score += 1;
-    }
-
-    score
-}
-
-fn looks_like_diagnostic_token(value: &str) -> bool {
-    let mut letters = 0;
-    let mut digits = 0;
-
-    for c in value.chars() {
-        if c.is_ascii_alphabetic() {
-            letters += 1;
-        } else if c.is_ascii_digit() {
-            digits += 1;
-        } else {
-            return false;
-        }
-    }
-
-    letters >= 2 && digits >= 3
 }
 
 fn normalize_test_summary(
@@ -405,7 +345,7 @@ fn merge_test_summaries(
     mut binlog_summary: binlog::TestSummary,
     raw_summary: binlog::TestSummary,
 ) -> binlog::TestSummary {
-    if raw_summary.total > 0 {
+    if binlog_summary.total == 0 && raw_summary.total > 0 {
         binlog_summary.passed = raw_summary.passed;
         binlog_summary.failed = raw_summary.failed;
         binlog_summary.skipped = raw_summary.skipped;
@@ -445,10 +385,10 @@ fn merge_restore_summaries(
     if binlog_summary.restored_projects == 0 {
         binlog_summary.restored_projects = raw_summary.restored_projects;
     }
-    if raw_summary.errors > binlog_summary.errors {
+    if binlog_summary.errors == 0 {
         binlog_summary.errors = raw_summary.errors;
     }
-    if raw_summary.warnings > binlog_summary.warnings {
+    if binlog_summary.warnings == 0 {
         binlog_summary.warnings = raw_summary.warnings;
     }
     if binlog_summary.duration_text.is_none() {
@@ -879,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_build_summaries_prefers_raw_when_binlog_loses_context() {
+    fn test_merge_build_summaries_keeps_structured_issues_when_present() {
         let binlog_summary = binlog::BuildSummary {
             succeeded: false,
             project_count: 11,
@@ -919,9 +859,10 @@ mod tests {
 
         let merged = merge_build_summaries(binlog_summary, raw_summary);
         assert_eq!(merged.project_count, 11);
-        assert_eq!(merged.errors.len(), 2);
-        assert_eq!(merged.errors[0].line, 13);
-        assert_eq!(merged.errors[0].column, 32);
+        assert_eq!(merged.errors.len(), 1);
+        assert_eq!(merged.errors[0].file, "IDE0055");
+        assert_eq!(merged.errors[0].line, 0);
+        assert_eq!(merged.errors[0].column, 0);
     }
 
     #[test]
@@ -976,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_test_summaries_prefers_raw_counts_and_failed_tests() {
+    fn test_merge_test_summaries_keeps_structured_counts_and_fills_failed_tests() {
         let binlog_summary = binlog::TestSummary {
             passed: 939,
             failed: 1,
@@ -1002,8 +943,8 @@ mod tests {
         };
 
         let merged = merge_test_summaries(binlog_summary, raw_summary);
-        assert_eq!(merged.skipped, 7);
-        assert_eq!(merged.total, 947);
+        assert_eq!(merged.skipped, 8);
+        assert_eq!(merged.total, 948);
         assert_eq!(merged.failed_tests.len(), 1);
         assert!(merged.failed_tests[0]
             .name
