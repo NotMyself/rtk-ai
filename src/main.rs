@@ -853,6 +853,19 @@ enum GoCommands {
 }
 
 fn main() -> Result<()> {
+    // Windows default stack is 1MB (vs 8MB on Linux/macOS).
+    // Clap's derived parser for our 45-variant Commands enum exceeds that in debug builds.
+    const STACK_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
+    let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
+    let handler = builder.spawn(run).context("failed to spawn main thread")?;
+
+    handler
+        .join()
+        .map_err(|e| anyhow::anyhow!("main thread panicked: {:?}", e))?
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
