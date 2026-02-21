@@ -101,10 +101,14 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
 
     let filtered = match subcommand {
         "build" => {
-            let binlog_summary = normalize_build_summary(
-                binlog::parse_build(&binlog_path)?,
-                output.status.success(),
-            );
+            let binlog_summary = if should_expect_binlog && binlog_path.exists() {
+                normalize_build_summary(
+                    binlog::parse_build(&binlog_path).unwrap_or_default(),
+                    output.status.success(),
+                )
+            } else {
+                binlog::BuildSummary::default()
+            };
             let raw_summary = normalize_build_summary(
                 binlog::parse_build_from_text(&raw),
                 output.status.success(),
@@ -149,10 +153,14 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
             )
         }
         "restore" => {
-            let binlog_summary = normalize_restore_summary(
-                binlog::parse_restore(&binlog_path)?,
-                output.status.success(),
-            );
+            let binlog_summary = if should_expect_binlog && binlog_path.exists() {
+                normalize_restore_summary(
+                    binlog::parse_restore(&binlog_path).unwrap_or_default(),
+                    output.status.success(),
+                )
+            } else {
+                binlog::RestoreSummary::default()
+            };
             let raw_summary = normalize_restore_summary(
                 binlog::parse_restore_from_text(&raw),
                 output.status.success(),
