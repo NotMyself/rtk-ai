@@ -1,43 +1,32 @@
 use crate::binlog::{FailedTest, TestSummary};
-use lazy_static::lazy_static;
-use regex::Regex;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
 use std::path::{Path, PathBuf};
 
-lazy_static! {
-    // Note: (?s) enables DOTALL mode so . matches newlines
-    static ref TRX_COUNTERS_RE: Regex = Regex::new(
-        r#"<Counters\b(?P<attrs>[^>]*)/?>"#
-    )
-    .expect("valid regex");
-    static ref TRX_TEST_RESULT_RE: Regex = Regex::new(
-        r#"(?s)<UnitTestResult\b(?P<attrs>[^>]*)>(?P<body>.*?)</UnitTestResult>"#
-    )
-    .expect("valid regex");
-    static ref TRX_ERROR_MESSAGE_RE: Regex = Regex::new(
-        r#"(?s)<ErrorInfo>.*?<Message>(?P<message>.*?)</Message>.*?<StackTrace>(?P<stack>.*?)</StackTrace>.*?</ErrorInfo>"#
-    )
-    .expect("valid regex");
-    static ref TRX_ATTR_RE: Regex =
-        Regex::new(r#"(?P<key>[A-Za-z_:][A-Za-z0-9_.:-]*)="(?P<value>[^"]*)""#)
-            .expect("valid regex");
+fn local_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|b| *b == b':').next().unwrap_or(name)
 }
 
-fn extract_attr_value<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
-    for captures in TRX_ATTR_RE.captures_iter(attrs) {
-        if captures.name("key").map(|m| m.as_str()) != Some(key) {
+fn extract_attr_value(
+    reader: &Reader<&[u8]>,
+    start: &BytesStart<'_>,
+    key: &[u8],
+) -> Option<String> {
+    for attr in start.attributes().flatten() {
+        if local_name(attr.key.as_ref()) != key {
             continue;
         }
 
-        if let Some(value) = captures.name("value") {
-            return Some(value.as_str());
+        if let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) {
+            return Some(value.into_owned());
         }
     }
 
     None
 }
 
-fn parse_usize_attr(attrs: &str, key: &str) -> usize {
-    extract_attr_value(attrs, key)
+fn parse_usize_attr(reader: &Reader<&[u8]>, start: &BytesStart<'_>, key: &[u8]) -> usize {
+    extract_attr_value(reader, start, key)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0)
 }
@@ -78,52 +67,160 @@ fn find_recent_trx_in_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 fn parse_trx_content(content: &str) -> Option<TestSummary> {
-    // Quick check if this looks like a TRX file
-    if !content.contains("<TestRun") || !content.contains("</TestRun>") {
-        return None;
+    #[derive(Clone, Copy)]
+    enum CaptureField {
+        Message,
+        StackTrace,
     }
 
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
     let mut summary = TestSummary::default();
+    let mut saw_test_run = false;
+    let mut in_failed_result = false;
+    let mut in_error_info = false;
+    let mut failed_test_name = String::new();
+    let mut message_buf = String::new();
+    let mut stack_buf = String::new();
+    let mut capture_field: Option<CaptureField> = None;
 
-    // Extract counters from ResultSummary
-    if let Some(captures) = TRX_COUNTERS_RE.captures(content) {
-        let attrs = captures.name("attrs").map(|m| m.as_str()).unwrap_or("");
-        summary.total = parse_usize_attr(attrs, "total");
-        summary.passed = parse_usize_attr(attrs, "passed");
-        summary.failed = parse_usize_attr(attrs, "failed");
-    }
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
+                b"TestRun" => saw_test_run = true,
+                b"Counters" => {
+                    summary.total = parse_usize_attr(&reader, &e, b"total");
+                    summary.passed = parse_usize_attr(&reader, &e, b"passed");
+                    summary.failed = parse_usize_attr(&reader, &e, b"failed");
+                }
+                b"UnitTestResult" => {
+                    let outcome = extract_attr_value(&reader, &e, b"outcome")
+                        .unwrap_or_else(|| "Unknown".to_string());
 
-    // Extract failed tests with details
-    for captures in TRX_TEST_RESULT_RE.captures_iter(content) {
-        let attrs = captures.name("attrs").map(|m| m.as_str()).unwrap_or("");
-        let outcome = extract_attr_value(attrs, "outcome").unwrap_or("Unknown");
+                    if outcome == "Failed" {
+                        in_failed_result = true;
+                        in_error_info = false;
+                        capture_field = None;
+                        message_buf.clear();
+                        stack_buf.clear();
+                        failed_test_name = extract_attr_value(&reader, &e, b"testName")
+                            .unwrap_or_else(|| "unknown".to_string());
+                    }
+                }
+                b"ErrorInfo" => {
+                    if in_failed_result {
+                        in_error_info = true;
+                    }
+                }
+                b"Message" => {
+                    if in_failed_result && in_error_info {
+                        capture_field = Some(CaptureField::Message);
+                        message_buf.clear();
+                    }
+                }
+                b"StackTrace" => {
+                    if in_failed_result && in_error_info {
+                        capture_field = Some(CaptureField::StackTrace);
+                        stack_buf.clear();
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                b"Counters" => {
+                    summary.total = parse_usize_attr(&reader, &e, b"total");
+                    summary.passed = parse_usize_attr(&reader, &e, b"passed");
+                    summary.failed = parse_usize_attr(&reader, &e, b"failed");
+                }
+                b"UnitTestResult" => {
+                    let outcome = extract_attr_value(&reader, &e, b"outcome")
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    if outcome == "Failed" {
+                        let name = extract_attr_value(&reader, &e, b"testName")
+                            .unwrap_or_else(|| "unknown".to_string());
+                        summary.failed_tests.push(FailedTest {
+                            name,
+                            details: Vec::new(),
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Text(e)) => {
+                if !in_failed_result {
+                    buf.clear();
+                    continue;
+                }
 
-        if outcome != "Failed" {
-            continue;
-        }
-
-        let name = extract_attr_value(attrs, "testName")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let full_match = captures.name("body").map(|m| m.as_str()).unwrap_or("");
-        let mut details = Vec::new();
-
-        // Try to extract error message and stack trace
-        if let Some(error_caps) = TRX_ERROR_MESSAGE_RE.captures(full_match) {
-            if let Some(msg) = error_caps.name("message") {
-                details.push(msg.as_str().trim().to_string());
-            }
-            if let Some(stack) = error_caps.name("stack") {
-                // Include first few lines of stack trace
-                let stack_lines: Vec<&str> = stack.as_str().lines().take(3).collect();
-                if !stack_lines.is_empty() {
-                    details.push(stack_lines.join("\n"));
+                let text = String::from_utf8_lossy(e.as_ref());
+                match capture_field {
+                    Some(CaptureField::Message) => message_buf.push_str(&text),
+                    Some(CaptureField::StackTrace) => stack_buf.push_str(&text),
+                    None => {}
                 }
             }
+            Ok(Event::CData(e)) => {
+                if !in_failed_result {
+                    buf.clear();
+                    continue;
+                }
+
+                let text = String::from_utf8_lossy(e.as_ref());
+                match capture_field {
+                    Some(CaptureField::Message) => message_buf.push_str(&text),
+                    Some(CaptureField::StackTrace) => stack_buf.push_str(&text),
+                    None => {}
+                }
+            }
+            Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
+                b"Message" | b"StackTrace" => {
+                    capture_field = None;
+                }
+                b"ErrorInfo" => {
+                    in_error_info = false;
+                }
+                b"UnitTestResult" => {
+                    if in_failed_result {
+                        let mut details = Vec::new();
+
+                        let message = message_buf.trim();
+                        if !message.is_empty() {
+                            details.push(message.to_string());
+                        }
+
+                        let stack = stack_buf.trim();
+                        if !stack.is_empty() {
+                            let stack_lines: Vec<&str> = stack.lines().take(3).collect();
+                            if !stack_lines.is_empty() {
+                                details.push(stack_lines.join("\n"));
+                            }
+                        }
+
+                        summary.failed_tests.push(FailedTest {
+                            name: failed_test_name.clone(),
+                            details,
+                        });
+
+                        in_failed_result = false;
+                        in_error_info = false;
+                        capture_field = None;
+                        message_buf.clear();
+                        stack_buf.clear();
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
         }
 
-        summary.failed_tests.push(FailedTest { name, details });
+        buf.clear();
+    }
+
+    if !saw_test_run {
+        return None;
     }
 
     // Calculate skipped from counters if available

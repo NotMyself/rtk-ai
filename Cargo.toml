@@ -28,6 +28,7 @@ chrono = "0.4"
 thiserror = "1.0"
 tempfile = "3"
 flate2 = "1.0"
+quick-xml = "0.37"
 
 [dev-dependencies]
 
