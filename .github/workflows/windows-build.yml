@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,3 +46,50 @@ jobs:
         with:
           name: rtk-x86_64-pc-windows-msvc
           path: rtk-x86_64-pc-windows-msvc.zip
+
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TAG="v${VERSION}-nme.${SHORT_SHA}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rtk-x86_64-pc-windows-msvc
+          path: release
+
+      - name: Create checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "rtk ${{ steps.version.outputs.version }} (Windows, ${{ steps.version.outputs.tag }})"
+          body: |
+            Windows build of rtk (Rust Token Killer) from fork branch `fork/nme-rtk-ai`.
+
+            Includes:
+            - Upstream rtk v${{ steps.version.outputs.version }}
+            - dotnet support (PR #172): `rtk dotnet build/test/restore/format`
+            - Windows CRLF fix for binlog duration parsing
+            - Debug stack overflow fix for Windows
+
+            **Install:** Download `rtk-x86_64-pc-windows-msvc.zip`, extract `rtk.exe`, add to PATH.
+          files: release/*
+          prerelease: true
+          target_commitish: ${{ github.sha }}
