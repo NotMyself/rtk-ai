@@ -1,0 +1,48 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [fork/nme-rtk-ai]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Lint
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings -A dead_code -A unused -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::collapsible_else_if -A clippy::needless_borrow -A clippy::needless_range_loop -A clippy::useless_format -A clippy::same_item_push -A clippy::option_as_ref_deref -A clippy::double_ended_iterator_last -A clippy::unnecessary_map_or -A clippy::trim_split_whitespace -A clippy::obfuscated_if_else -A clippy::derivable_impls -A clippy::bool_assert_comparison
+
+      - name: Test
+        run: cargo test --all
+
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        run: |
+          cd target/x86_64-pc-windows-msvc/release
+          7z a ../../../rtk-x86_64-pc-windows-msvc.zip rtk.exe
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtk-x86_64-pc-windows-msvc
+          path: rtk-x86_64-pc-windows-msvc.zip
