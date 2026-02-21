@@ -89,6 +89,18 @@ lazy_static! {
         Regex::new(r"^[A-Za-z]{2,}\d{3,}$").expect("valid regex");
     static ref SOURCE_FILE_RE: Regex = Regex::new(r"(?i)([A-Za-z]:)?[/\\][^\s]+\.(cs|vb|fs)")
         .expect("valid regex");
+    static ref SENSITIVE_ENV_RE: Regex = {
+        let keys = SENSITIVE_ENV_VARS
+            .iter()
+            .map(|key| regex::escape(key))
+            .collect::<Vec<_>>()
+            .join("|");
+        Regex::new(&format!(
+            r"(?P<prefix>\b(?:{})\s*(?:=|:)\s*)(?P<value>[^\s;]+)",
+            keys
+        ))
+        .expect("valid regex")
+    };
 }
 
 const SENSITIVE_ENV_VARS: &[&str] = &[
@@ -591,23 +603,9 @@ impl<'a> BinReader<'a> {
 }
 
 pub fn scrub_sensitive_env_vars(input: &str) -> String {
-    let mut output = input.to_string();
-
-    for key in SENSITIVE_ENV_VARS {
-        let escaped_key = regex::escape(key);
-
-        let equals_pattern = format!(r"(?P<prefix>\b{}\s*=\s*)(?P<value>[^\s;]+)", escaped_key);
-        if let Ok(re) = Regex::new(&equals_pattern) {
-            output = re.replace_all(&output, "${prefix}[REDACTED]").into_owned();
-        }
-
-        let colon_pattern = format!(r"(?P<prefix>\b{}\s*:\s*)(?P<value>[^\s;]+)", escaped_key);
-        if let Ok(re) = Regex::new(&colon_pattern) {
-            output = re.replace_all(&output, "${prefix}[REDACTED]").into_owned();
-        }
-    }
-
-    output
+    SENSITIVE_ENV_RE
+        .replace_all(input, "${prefix}[REDACTED]")
+        .into_owned()
 }
 
 pub fn parse_build_from_text(text: &str) -> BuildSummary {
