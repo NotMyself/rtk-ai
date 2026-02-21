@@ -55,6 +55,9 @@ rtk tsc                 # TypeScript errors grouped by file/code (83%)
 rtk lint                # ESLint/Biome violations grouped (84%)
 rtk prettier --check    # Files needing format only (70%)
 rtk next build          # Next.js build with route metrics (87%)
+rtk dotnet build        # .NET build with binlog parsing (93%)
+rtk dotnet restore      # .NET restore summary
+rtk dotnet format       # .NET format check (89%)
 ```
 
 ### Test (90-99% savings)
@@ -62,6 +65,7 @@ rtk next build          # Next.js build with route metrics (87%)
 rtk cargo test          # Cargo test failures only (90%)
 rtk vitest run          # Vitest failures only (99.5%)
 rtk playwright test     # Playwright failures only (94%)
+rtk dotnet test         # .NET test with TRX parsing (86%)
 rtk test <cmd>          # Generic test wrapper - failures only
 ```
 
@@ -150,8 +154,8 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 
 | Category | Commands | Typical Savings |
 |----------|----------|-----------------|
-| Tests | vitest, playwright, cargo test | 90-99% |
-| Build | next, tsc, lint, prettier | 70-87% |
+| Tests | vitest, playwright, cargo test, dotnet test | 86-99% |
+| Build | next, tsc, lint, prettier, dotnet build | 70-93% |
 | Git | status, log, diff, add, commit | 59-80% |
 | GitHub | gh pr, gh run, gh issue | 26-87% |
 | Package Managers | pnpm, npm, npx | 70-90% |
