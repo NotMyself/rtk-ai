@@ -829,26 +829,34 @@ pub fn parse_test_from_text(text: &str) -> TestSummary {
         duration_text: extract_duration(&scrubbed),
     };
 
-    if let Some(captures) = TEST_RESULT_RE.captures(&scrubbed) {
-        summary.passed = captures
+    let mut found_summary_line = false;
+    let mut fallback_duration = None;
+    for captures in TEST_RESULT_RE.captures_iter(&scrubbed) {
+        found_summary_line = true;
+        summary.passed += captures
             .name("passed")
             .and_then(|m| m.as_str().parse::<usize>().ok())
             .unwrap_or(0);
-        summary.failed = captures
+        summary.failed += captures
             .name("failed")
             .and_then(|m| m.as_str().parse::<usize>().ok())
             .unwrap_or(0);
-        summary.skipped = captures
+        summary.skipped += captures
             .name("skipped")
             .and_then(|m| m.as_str().parse::<usize>().ok())
             .unwrap_or(0);
-        summary.total = captures
+        summary.total += captures
             .name("total")
             .and_then(|m| m.as_str().parse::<usize>().ok())
             .unwrap_or(0);
+
         if let Some(duration) = captures.name("duration") {
-            summary.duration_text = Some(duration.as_str().trim().to_string());
+            fallback_duration = Some(duration.as_str().trim().to_string());
         }
+    }
+
+    if found_summary_line && summary.duration_text.is_none() {
+        summary.duration_text = fallback_duration;
     }
 
     let lines: Vec<&str> = scrubbed.lines().collect();
@@ -1234,6 +1242,22 @@ Passed!  - Failed:     0, Passed:   940, Skipped:     7, Total:   947, Duration:
         let summary = parse_test_from_text(input);
         assert_eq!(summary.failed, 0);
         assert!(summary.failed_tests.is_empty());
+    }
+
+    #[test]
+    fn test_parse_test_from_text_aggregates_multiple_project_summaries() {
+        let input = r#"
+Passed!  - Failed:     0, Passed:   914, Skipped:     7, Total:   921, Duration: 00:00:08.20
+Failed!  - Failed:     1, Passed:    26, Skipped:     0, Total:    27, Duration: 00:00:00.54
+Time Elapsed 00:00:12.34
+"#;
+
+        let summary = parse_test_from_text(input);
+        assert_eq!(summary.passed, 940);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.skipped, 7);
+        assert_eq!(summary.total, 948);
+        assert_eq!(summary.duration_text.as_deref(), Some("00:00:12.34"));
     }
 
     #[test]
