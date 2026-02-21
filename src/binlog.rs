@@ -68,7 +68,7 @@ lazy_static! {
         Regex::new(r"(?mi)^.+\(\d+,\d+\):\s*warning(?:\s+[A-Za-z]{2,}\d{3,})?(?:\s*:.*)?$")
             .expect("valid regex");
     static ref DURATION_RE: Regex =
-        Regex::new(r"(?m)^\s*Time Elapsed\s+(?P<duration>[^\r\n]+)$").expect("valid regex");
+        Regex::new(r"(?m)^\s*Time Elapsed\s+(?P<duration>[^\r\n]+?)\r?$").expect("valid regex");
     static ref TEST_RESULT_RE: Regex = Regex::new(
         r"(?m)(?:Passed!|Failed!)\s*-\s*Failed:\s*(?P<failed>\d+),\s*Passed:\s*(?P<passed>\d+),\s*Skipped:\s*(?P<skipped>\d+),\s*Total:\s*(?P<total>\d+),\s*Duration:\s*(?P<duration>[^\r\n-]+)"
     )
