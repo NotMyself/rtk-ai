@@ -149,10 +149,16 @@ test_rewrite "env + docker compose" \
   "COMPOSE_PROJECT_NAME=test docker compose up -d" \
   "COMPOSE_PROJECT_NAME=test rtk docker compose up -d"
 
+test_rewrite "env + dotnet test" \
+  "DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet test --nologo" \
+  "DOTNET_CLI_TELEMETRY_OPTOUT=1 rtk dotnet test --nologo"
+
 echo ""
 
 # ---- SECTION 3: New patterns ----
 echo "--- New patterns ---"
+
+# JS/TS
 test_rewrite "npm run test:e2e" \
   "npm run test:e2e" \
   "rtk npm test:e2e"
@@ -173,6 +179,20 @@ test_rewrite "npx vue-tsc --noEmit" \
   "npx vue-tsc --noEmit" \
   "rtk tsc --noEmit"
 
+# .NET
+test_rewrite "dotnet build" \
+  "dotnet build" \
+  "rtk dotnet build"
+
+test_rewrite "dotnet test --nologo" \
+  "dotnet test --nologo" \
+  "rtk dotnet test --nologo"
+
+test_rewrite "dotnet restore src/App.sln" \
+  "dotnet restore src/App.sln" \
+  "rtk dotnet restore src/App.sln"
+
+# Containers
 test_rewrite "docker compose up -d" \
   "docker compose up -d" \
   "rtk docker compose up -d"
@@ -193,18 +213,7 @@ test_rewrite "docker exec -it db psql" \
   "docker exec -it db psql" \
   "rtk docker exec -it db psql"
 
-test_rewrite "find (NOT rewritten — different arg format)" \
-  "find . -name '*.ts'" \
-  ""
-
-test_rewrite "tree (NOT rewritten — different arg format)" \
-  "tree src/" \
-  ""
-
-test_rewrite "wget (NOT rewritten — different arg format)" \
-  "wget https://example.com/file" \
-  ""
-
+# GitHub / Kubernetes
 test_rewrite "gh api repos/owner/repo" \
   "gh api repos/owner/repo" \
   "rtk gh api repos/owner/repo"
@@ -220,6 +229,19 @@ test_rewrite "kubectl describe pod foo" \
 test_rewrite "kubectl apply -f deploy.yaml" \
   "kubectl apply -f deploy.yaml" \
   "rtk kubectl apply -f deploy.yaml"
+
+# Intentionally not rewritten (format-specific)
+test_rewrite "find (NOT rewritten — different arg format)" \
+  "find . -name '*.ts'" \
+  ""
+
+test_rewrite "tree (NOT rewritten — different arg format)" \
+  "tree src/" \
+  ""
+
+test_rewrite "wget (NOT rewritten — different arg format)" \
+  "wget https://example.com/file" \
+  ""
 
 echo ""
 

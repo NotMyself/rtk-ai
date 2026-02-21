@@ -102,6 +102,10 @@ elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+nextest([[:space:]]|$)'; th
 elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]+fmt([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cargo fmt/rtk cargo fmt/')"
 
+# --- .NET ---
+elif echo "$MATCH_CMD" | grep -qE '^dotnet[[:space:]]+(build|test|restore)([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^dotnet/rtk dotnet/')"
+
 # --- File operations ---
 elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"

@@ -72,6 +72,10 @@ elif echo "$MATCH_CMD" | grep -qE '^cargo[[:space:]]'; then
       ;;
   esac
 
+# --- .NET ---
+elif echo "$MATCH_CMD" | grep -qE '^dotnet[[:space:]]+(build|test|restore)([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^dotnet/rtk dotnet/')"
+
 # --- File operations ---
 elif echo "$MATCH_CMD" | grep -qE '^cat[[:space:]]+'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^cat /rtk read /')"
