@@ -6,17 +6,40 @@ use std::path::{Path, PathBuf};
 lazy_static! {
     // Note: (?s) enables DOTALL mode so . matches newlines
     static ref TRX_COUNTERS_RE: Regex = Regex::new(
-        r#"<Counters\s+total="(?P<total>\d+)"\s+executed="(?P<executed>\d+)"\s+passed="(?P<passed>\d+)"\s+failed="(?P<failed>\d+)""#
+        r#"<Counters\b(?P<attrs>[^>]*)/?>"#
     )
     .expect("valid regex");
     static ref TRX_TEST_RESULT_RE: Regex = Regex::new(
-        r#"(?s)<UnitTestResult[^>]*testName="(?P<name>[^"]+)"[^>]*outcome="(?P<outcome>[^"]+)"[^>]*>(.*?)</UnitTestResult>"#
+        r#"(?s)<UnitTestResult\b(?P<attrs>[^>]*)>(?P<body>.*?)</UnitTestResult>"#
     )
     .expect("valid regex");
     static ref TRX_ERROR_MESSAGE_RE: Regex = Regex::new(
         r#"(?s)<ErrorInfo>.*?<Message>(?P<message>.*?)</Message>.*?<StackTrace>(?P<stack>.*?)</StackTrace>.*?</ErrorInfo>"#
     )
     .expect("valid regex");
+    static ref TRX_ATTR_RE: Regex =
+        Regex::new(r#"(?P<key>[A-Za-z_:][A-Za-z0-9_.:-]*)="(?P<value>[^"]*)""#)
+            .expect("valid regex");
+}
+
+fn extract_attr_value<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    for captures in TRX_ATTR_RE.captures_iter(attrs) {
+        if captures.name("key").map(|m| m.as_str()) != Some(key) {
+            continue;
+        }
+
+        if let Some(value) = captures.name("value") {
+            return Some(value.as_str());
+        }
+    }
+
+    None
+}
+
+fn parse_usize_attr(attrs: &str, key: &str) -> usize {
+    extract_attr_value(attrs, key)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// Parse TRX (Visual Studio Test Results) file to extract test summary.
@@ -64,37 +87,26 @@ fn parse_trx_content(content: &str) -> Option<TestSummary> {
 
     // Extract counters from ResultSummary
     if let Some(captures) = TRX_COUNTERS_RE.captures(content) {
-        summary.total = captures
-            .name("total")
-            .and_then(|m| m.as_str().parse().ok())
-            .unwrap_or(0);
-        summary.passed = captures
-            .name("passed")
-            .and_then(|m| m.as_str().parse().ok())
-            .unwrap_or(0);
-        summary.failed = captures
-            .name("failed")
-            .and_then(|m| m.as_str().parse().ok())
-            .unwrap_or(0);
+        let attrs = captures.name("attrs").map(|m| m.as_str()).unwrap_or("");
+        summary.total = parse_usize_attr(attrs, "total");
+        summary.passed = parse_usize_attr(attrs, "passed");
+        summary.failed = parse_usize_attr(attrs, "failed");
     }
 
     // Extract failed tests with details
     for captures in TRX_TEST_RESULT_RE.captures_iter(content) {
-        let outcome = captures
-            .name("outcome")
-            .map(|m| m.as_str())
-            .unwrap_or("Unknown");
+        let attrs = captures.name("attrs").map(|m| m.as_str()).unwrap_or("");
+        let outcome = extract_attr_value(attrs, "outcome").unwrap_or("Unknown");
 
         if outcome != "Failed" {
             continue;
         }
 
-        let name = captures
-            .name("name")
-            .map(|m| m.as_str().to_string())
+        let name = extract_attr_value(attrs, "testName")
+            .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let full_match = captures.get(0).map(|m| m.as_str()).unwrap_or("");
+        let full_match = captures.name("body").map(|m| m.as_str()).unwrap_or("");
         let mut details = Vec::new();
 
         // Try to extract error message and stack trace
@@ -174,6 +186,47 @@ mod tests {
             "MyTests.Calculator.Add_ShouldFail"
         );
         assert!(summary.failed_tests[0].details[0].contains("Expected: 5, Actual: 4"));
+    }
+
+    #[test]
+    fn test_parse_trx_content_extracts_counters_when_attribute_order_varies() {
+        let trx = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun>
+  <ResultSummary outcome="Completed">
+    <Counters failed="3" passed="7" executed="10" total="10" />
+  </ResultSummary>
+</TestRun>"#;
+
+        let summary = parse_trx_content(trx).expect("valid TRX");
+        assert_eq!(summary.total, 10);
+        assert_eq!(summary.passed, 7);
+        assert_eq!(summary.failed, 3);
+    }
+
+    #[test]
+    fn test_parse_trx_content_extracts_failed_tests_when_attribute_order_varies() {
+        let trx = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun>
+  <Results>
+    <UnitTestResult outcome="Failed" testName="MyTests.Ordering.ShouldStillParse">
+      <Output>
+        <ErrorInfo>
+          <Message>Boom</Message>
+          <StackTrace>at MyTests.Ordering.ShouldStillParse()</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <ResultSummary><Counters failed="1" passed="0" executed="1" total="1" /></ResultSummary>
+</TestRun>"#;
+
+        let summary = parse_trx_content(trx).expect("valid TRX");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failed_tests.len(), 1);
+        assert_eq!(
+            summary.failed_tests[0].name,
+            "MyTests.Ordering.ShouldStillParse"
+        );
     }
 
     #[test]
