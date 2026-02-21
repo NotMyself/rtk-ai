@@ -94,6 +94,15 @@ pub fn parse_trx_file(path: &Path) -> Option<TestSummary> {
     parse_trx_content(&content)
 }
 
+pub fn parse_trx_file_since(path: &Path, since: SystemTime) -> Option<TestSummary> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    if modified < since {
+        return None;
+    }
+
+    parse_trx_file(path)
+}
+
 pub fn parse_trx_files_in_dir(dir: &Path) -> Option<TestSummary> {
     parse_trx_files_in_dir_since(dir, None)
 }
@@ -109,7 +118,10 @@ pub fn parse_trx_files_in_dir_since(dir: &Path, since: Option<SystemTime>) -> Op
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map(|e| e == "trx") != Some(true) {
+        if path
+            .extension()
+            .is_none_or(|e| !e.eq_ignore_ascii_case("trx"))
+        {
             continue;
         }
 
@@ -560,6 +572,21 @@ mod tests {
         std::fs::write(trx_dir.join("new.trx"), trx_new).expect("write new trx");
 
         let summary = parse_trx_files_in_dir_since(&trx_dir, Some(since)).expect("merged summary");
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn test_parse_trx_files_in_dir_since_handles_uppercase_extension() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let trx_dir = temp_dir.path().join("TestResults");
+        std::fs::create_dir_all(&trx_dir).expect("create TestResults");
+
+        let trx = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun><ResultSummary><Counters total="3" executed="3" passed="2" failed="1" /></ResultSummary></TestRun>"#;
+        std::fs::write(trx_dir.join("UPPER.TRX"), trx).expect("write trx");
+
+        let summary = parse_trx_files_in_dir_since(&trx_dir, None).expect("summary");
         assert_eq!(summary.total, 3);
         assert_eq!(summary.failed, 1);
     }

@@ -269,7 +269,7 @@ fn merge_test_summary_from_trx(
 
     if trx_summary.is_none() {
         if let Some(trx) = fallback_trx_path {
-            trx_summary = dotnet_trx::parse_trx_file(&trx);
+            trx_summary = dotnet_trx::parse_trx_file_since(&trx, command_started_at);
         }
     }
 
@@ -347,7 +347,12 @@ fn has_binlog_arg(args: &[String]) -> bool {
 fn has_verbosity_arg(args: &[String]) -> bool {
     args.iter().any(|arg| {
         let lower = arg.to_ascii_lowercase();
-        lower.starts_with("-v:") || lower.starts_with("/v:") || lower == "-v" || lower == "/v"
+        lower.starts_with("-v:")
+            || lower.starts_with("/v:")
+            || lower == "-v"
+            || lower == "/v"
+            || lower == "--verbosity"
+            || lower.starts_with("--verbosity=")
     })
 }
 
@@ -1173,6 +1178,16 @@ mod tests {
     }
 
     #[test]
+    fn test_user_long_verbosity_override() {
+        let args = vec!["--verbosity".to_string(), "detailed".to_string()];
+
+        let injected = build_dotnet_args_for_test("build", &args, false);
+        assert!(injected.contains(&"--verbosity".to_string()));
+        assert!(injected.contains(&"detailed".to_string()));
+        assert!(!injected.contains(&"-v:minimal".to_string()));
+    }
+
+    #[test]
     fn test_test_subcommand_does_not_inject_minimal_verbosity_by_default() {
         let args = Vec::<String>::new();
 
@@ -1259,7 +1274,7 @@ mod tests {
             binlog::TestSummary::default(),
             Some(&missing_primary),
             Some(fallback.clone()),
-            SystemTime::now(),
+            UNIX_EPOCH,
         );
 
         assert_eq!(filled.total, 2);
@@ -1279,6 +1294,26 @@ mod tests {
             SystemTime::now(),
         );
         assert_eq!(filled.total, 0);
+    }
+
+    #[test]
+    fn test_merge_test_summary_from_trx_ignores_stale_fallback_file() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let fallback = temp_dir.path().join("fallback.trx");
+        fs::write(&fallback, trx_with_counts(2, 1, 1)).expect("write fallback trx");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let command_started_at = SystemTime::now();
+        let missing_primary = temp_dir.path().join("missing.trx");
+
+        let filled = merge_test_summary_from_trx(
+            binlog::TestSummary::default(),
+            Some(&missing_primary),
+            Some(fallback.clone()),
+            command_started_at,
+        );
+
+        assert_eq!(filled.total, 0);
+        assert!(fallback.exists());
     }
 
     #[test]
