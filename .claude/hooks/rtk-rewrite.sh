@@ -14,6 +14,9 @@ _rtk_audit_log() {
     >> "${dir}/hook-audit.log"
 }
 
+# Ensure cargo-installed binaries (rtk) are on PATH
+export PATH="${HOME}/.cargo/bin:${PATH}"
+
 # Guards: skip silently if dependencies missing
 if ! command -v rtk &>/dev/null || ! command -v jq &>/dev/null; then
   _rtk_audit_log "skip:no_deps" "-"
@@ -21,6 +24,9 @@ if ! command -v rtk &>/dev/null || ! command -v jq &>/dev/null; then
 fi
 
 set -euo pipefail
+
+# Resolve full path to rtk so rewritten commands work even when PATH lacks ~/.cargo/bin
+RTK_BIN=$(command -v rtk)
 
 INPUT=$(cat)
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
@@ -206,6 +212,9 @@ if [ -z "$REWRITTEN" ]; then
   _rtk_audit_log "skip:no_match" "$CMD"
   exit 0
 fi
+
+# Replace literal 'rtk ' with full path so the execution shell doesn't need rtk in PATH
+REWRITTEN="${REWRITTEN/rtk /$RTK_BIN }"
 
 _rtk_audit_log "rewrite" "$CMD" "$REWRITTEN"
 
