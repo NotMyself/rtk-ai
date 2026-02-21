@@ -10,6 +10,7 @@ mod diff_cmd;
 mod discover;
 mod display_helpers;
 mod dotnet_cmd;
+mod dotnet_format_report;
 mod dotnet_trx;
 mod env_cmd;
 mod filter;
@@ -881,6 +882,12 @@ enum DotnetCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Format with compact output
+    Format {
+        /// Additional dotnet format arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Passthrough: runs any unsupported dotnet subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
@@ -1336,6 +1343,9 @@ fn run() -> Result<()> {
             }
             DotnetCommands::Restore { args } => {
                 dotnet_cmd::run_restore(&args, cli.verbose)?;
+            }
+            DotnetCommands::Format { args } => {
+                dotnet_cmd::run_format(&args, cli.verbose)?;
             }
             DotnetCommands::Other(args) => {
                 dotnet_cmd::run_passthrough(&args, cli.verbose)?;

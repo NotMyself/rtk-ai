@@ -1,4 +1,5 @@
 use crate::binlog;
+use crate::dotnet_format_report;
 use crate::dotnet_trx;
 use crate::tracking;
 use crate::utils::truncate;
@@ -23,6 +24,52 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<()> {
 
 pub fn run_restore(args: &[String], verbose: u8) -> Result<()> {
     run_dotnet_with_binlog("restore", args, verbose)
+}
+
+pub fn run_format(args: &[String], verbose: u8) -> Result<()> {
+    let timer = tracking::TimedExecution::start();
+    let (report_path, cleanup_report_path) = resolve_format_report_path(args);
+    let mut cmd = Command::new("dotnet");
+    cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
+    cmd.arg("format");
+
+    for arg in build_effective_dotnet_format_args(args, report_path.as_deref()) {
+        cmd.arg(arg);
+    }
+
+    if verbose > 0 {
+        eprintln!("Running: dotnet format {}", args.join(" "));
+    }
+
+    let command_started_at = SystemTime::now();
+    let output = cmd.output().context("Failed to run dotnet format")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let raw = format!("{}\n{}", stdout, stderr);
+
+    let check_mode = !has_write_mode_override(args);
+    let filtered =
+        format_report_summary_or_raw(report_path.as_deref(), check_mode, &raw, command_started_at);
+    println!("{}", filtered);
+
+    timer.track(
+        &format!("dotnet format {}", args.join(" ")),
+        &format!("rtk dotnet format {}", args.join(" ")),
+        &raw,
+        &filtered,
+    );
+
+    if cleanup_report_path {
+        if let Some(path) = report_path.as_deref() {
+            cleanup_temp_file(path);
+        }
+    }
+
+    if !output.status.success() {
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
+    Ok(())
 }
 
 pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<()> {
@@ -239,6 +286,123 @@ fn resolve_trx_results_dir(subcommand: &str, args: &[String]) -> (Option<PathBuf
     (Some(build_trx_results_dir()), true)
 }
 
+fn build_format_report_path() -> PathBuf {
+    std::env::temp_dir().join(format!("rtk_dotnet_format_{}.json", unique_temp_suffix()))
+}
+
+fn resolve_format_report_path(args: &[String]) -> (Option<PathBuf>, bool) {
+    if let Some(user_report_path) = extract_report_arg(args) {
+        return (Some(user_report_path), false);
+    }
+
+    (Some(build_format_report_path()), true)
+}
+
+fn build_effective_dotnet_format_args(args: &[String], report_path: Option<&Path>) -> Vec<String> {
+    let mut effective: Vec<String> = args
+        .iter()
+        .filter(|arg| !arg.eq_ignore_ascii_case("--write"))
+        .cloned()
+        .collect();
+    let force_write_mode = has_write_mode_override(args);
+
+    if !force_write_mode && !has_verify_no_changes_arg(args) {
+        effective.push("--verify-no-changes".to_string());
+    }
+
+    if !has_report_arg(args) {
+        if let Some(path) = report_path {
+            effective.push("--report".to_string());
+            effective.push(path.display().to_string());
+        }
+    }
+
+    effective
+}
+
+fn format_report_summary_or_raw(
+    report_path: Option<&Path>,
+    check_mode: bool,
+    raw: &str,
+    command_started_at: SystemTime,
+) -> String {
+    let Some(report_path) = report_path else {
+        return raw.to_string();
+    };
+
+    if !is_fresh_report(report_path, command_started_at) {
+        return raw.to_string();
+    }
+
+    match dotnet_format_report::parse_format_report(report_path) {
+        Ok(summary) => format_dotnet_format_output(&summary, check_mode),
+        Err(_) => raw.to_string(),
+    }
+}
+
+fn is_fresh_report(path: &Path, command_started_at: SystemTime) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+
+    modified_at.duration_since(command_started_at).is_ok()
+}
+
+fn format_dotnet_format_output(
+    summary: &dotnet_format_report::FormatSummary,
+    check_mode: bool,
+) -> String {
+    let changed_count = summary.files_with_changes.len();
+
+    if changed_count == 0 {
+        return format!(
+            "ok dotnet format: {} files formatted correctly",
+            summary.total_files
+        );
+    }
+
+    if !check_mode {
+        return format!(
+            "ok dotnet format: formatted {} files ({} already formatted)",
+            changed_count, summary.files_unchanged
+        );
+    }
+
+    let mut output = format!("Format: {} files need formatting", changed_count);
+    output.push_str("\n---------------------------------------");
+
+    for (index, file) in summary.files_with_changes.iter().take(20).enumerate() {
+        let first_change = &file.changes[0];
+        let rule = if first_change.diagnostic_id.is_empty() {
+            first_change.format_description.as_str()
+        } else {
+            first_change.diagnostic_id.as_str()
+        };
+        output.push_str(&format!(
+            "\n{}. {} (line {}, col {}, {})",
+            index + 1,
+            file.path,
+            first_change.line_number,
+            first_change.char_number,
+            rule
+        ));
+    }
+
+    if changed_count > 20 {
+        output.push_str(&format!("\n... +{} more files", changed_count - 20));
+    }
+
+    output.push_str(&format!(
+        "\n\nok {} files already formatted\nRun `dotnet format` to apply fixes",
+        summary.files_unchanged
+    ));
+    output
+}
+
 fn cleanup_temp_file(path: &Path) {
     if path.exists() {
         std::fs::remove_file(path).ok();
@@ -392,6 +556,48 @@ fn has_results_directory_arg(args: &[String]) -> bool {
         let lower = arg.to_ascii_lowercase();
         lower == "--results-directory" || lower.starts_with("--results-directory=")
     })
+}
+
+fn has_report_arg(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower == "--report" || lower.starts_with("--report=")
+    })
+}
+
+fn extract_report_arg(args: &[String]) -> Option<PathBuf> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg.eq_ignore_ascii_case("--report") {
+            if let Some(next) = iter.peek() {
+                return Some(PathBuf::from(next.as_str()));
+            }
+            continue;
+        }
+
+        if let Some((_, value)) = arg.split_once('=') {
+            if arg
+                .split('=')
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("--report"))
+            {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+
+    None
+}
+
+fn has_verify_no_changes_arg(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower == "--verify-no-changes" || lower.starts_with("--verify-no-changes=")
+    })
+}
+
+fn has_write_mode_override(args: &[String]) -> bool {
+    args.iter().any(|arg| arg.eq_ignore_ascii_case("--write"))
 }
 
 fn extract_results_directory_arg(args: &[String]) -> Option<PathBuf> {
@@ -718,7 +924,9 @@ fn format_restore_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dotnet_format_report;
     use std::fs;
+    use std::time::Duration;
 
     fn build_dotnet_args_for_test(
         subcommand: &str,
@@ -745,6 +953,14 @@ mod tests {
 </TestRun>"#,
             total, total, passed, failed
         )
+    }
+
+    fn format_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("dotnet")
+            .join(name)
     }
 
     #[test]
@@ -1431,6 +1647,91 @@ mod tests {
         let (dir, cleanup) = resolve_trx_results_dir("test", &args);
         assert!(dir.is_some());
         assert!(cleanup);
+    }
+
+    #[test]
+    fn test_format_all_formatted() {
+        let summary =
+            dotnet_format_report::parse_format_report(&format_fixture("format_success.json"))
+                .expect("parse format report");
+
+        let output = format_dotnet_format_output(&summary, true);
+        assert!(output.contains("ok dotnet format: 2 files formatted correctly"));
+    }
+
+    #[test]
+    fn test_format_needs_formatting() {
+        let summary =
+            dotnet_format_report::parse_format_report(&format_fixture("format_changes.json"))
+                .expect("parse format report");
+
+        let output = format_dotnet_format_output(&summary, true);
+        assert!(output.contains("Format: 2 files need formatting"));
+        assert!(output.contains("src/Program.cs (line 42, col 17, WHITESPACE)"));
+        assert!(output.contains("Run `dotnet format` to apply fixes"));
+    }
+
+    #[test]
+    fn test_format_temp_file_cleanup() {
+        let args = Vec::<String>::new();
+        let (report_path, cleanup) = resolve_format_report_path(&args);
+        let report_path = report_path.expect("report path");
+
+        assert!(cleanup);
+        fs::write(&report_path, "[]").expect("write temp report");
+        cleanup_temp_file(&report_path);
+        assert!(!report_path.exists());
+    }
+
+    #[test]
+    fn test_format_user_report_arg_no_cleanup() {
+        let args = vec![
+            "--report".to_string(),
+            "/tmp/user-format-report.json".to_string(),
+        ];
+
+        let (report_path, cleanup) = resolve_format_report_path(&args);
+        assert_eq!(
+            report_path,
+            Some(PathBuf::from("/tmp/user-format-report.json"))
+        );
+        assert!(!cleanup);
+    }
+
+    #[test]
+    fn test_format_preserves_positional_project_argument_order() {
+        let args = vec!["src/App/App.csproj".to_string()];
+
+        let effective =
+            build_effective_dotnet_format_args(&args, Some(Path::new("/tmp/report.json")));
+        assert_eq!(
+            effective.first().map(String::as_str),
+            Some("src/App/App.csproj")
+        );
+    }
+
+    #[test]
+    fn test_format_report_summary_ignores_stale_report_file() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let report = temp_dir.path().join("report.json");
+        fs::write(&report, "[]").expect("write report");
+
+        let command_started_at = SystemTime::now()
+            .checked_add(Duration::from_secs(2))
+            .expect("future timestamp");
+        let raw = "RAW OUTPUT";
+
+        let output = format_report_summary_or_raw(Some(&report), true, raw, command_started_at);
+        assert_eq!(output, raw);
+    }
+
+    #[test]
+    fn test_format_report_summary_uses_fresh_report_file() {
+        let report = format_fixture("format_success.json");
+        let raw = "RAW OUTPUT";
+
+        let output = format_report_summary_or_raw(Some(&report), true, raw, UNIX_EPOCH);
+        assert!(output.contains("ok dotnet format: 2 files formatted correctly"));
     }
 
     #[test]
