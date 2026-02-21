@@ -72,12 +72,8 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     let binlog_path = build_binlog_path(subcommand);
     let should_expect_binlog = subcommand != "test" || has_binlog_arg(args);
 
-    // For test commands, create an isolated TRX results directory
-    let trx_results_dir = if subcommand == "test" {
-        Some(build_trx_results_dir())
-    } else {
-        None
-    };
+    // For test commands, prefer user-provided results directory; otherwise create isolated one.
+    let (trx_results_dir, cleanup_trx_results_dir) = resolve_trx_results_dir(subcommand, args);
 
     let mut cmd = Command::new("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
@@ -93,6 +89,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         eprintln!("Running: dotnet {} {}", subcommand, args.join(" "));
     }
 
+    let command_started_at = SystemTime::now();
     let output = cmd
         .output()
         .with_context(|| format!("Failed to run dotnet {}", subcommand))?;
@@ -131,6 +128,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
                 merged_summary,
                 trx_results_dir.as_deref(),
                 dotnet_trx::find_recent_trx_in_testresults(),
+                command_started_at,
             );
 
             let summary = normalize_test_summary(summary, output.status.success());
@@ -186,8 +184,10 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     );
 
     cleanup_temp_file(&binlog_path);
-    if let Some(dir) = trx_results_dir.as_deref() {
-        cleanup_temp_dir(dir);
+    if cleanup_trx_results_dir {
+        if let Some(dir) = trx_results_dir.as_deref() {
+            cleanup_temp_dir(dir);
+        }
     }
 
     if verbose > 0 {
@@ -219,6 +219,18 @@ fn build_trx_results_dir() -> PathBuf {
     std::env::temp_dir().join(format!("rtk_dotnet_testresults_{}", ts))
 }
 
+fn resolve_trx_results_dir(subcommand: &str, args: &[String]) -> (Option<PathBuf>, bool) {
+    if subcommand != "test" {
+        return (None, false);
+    }
+
+    if let Some(user_dir) = extract_results_directory_arg(args) {
+        return (Some(user_dir), false);
+    }
+
+    (Some(build_trx_results_dir()), true)
+}
+
 fn cleanup_temp_file(path: &Path) {
     if path.exists() {
         std::fs::remove_file(path).ok();
@@ -235,11 +247,16 @@ fn merge_test_summary_from_trx(
     mut summary: binlog::TestSummary,
     trx_results_dir: Option<&Path>,
     fallback_trx_path: Option<PathBuf>,
+    command_started_at: SystemTime,
 ) -> binlog::TestSummary {
     let mut trx_summary = None;
 
     if let Some(dir) = trx_results_dir.filter(|path| path.exists()) {
-        trx_summary = dotnet_trx::parse_trx_files_in_dir(dir);
+        trx_summary = dotnet_trx::parse_trx_files_in_dir_since(dir, Some(command_started_at));
+
+        if trx_summary.is_none() {
+            trx_summary = dotnet_trx::parse_trx_files_in_dir(dir);
+        }
     }
 
     if trx_summary.is_none() {
@@ -294,9 +311,11 @@ fn build_effective_dotnet_args(
         effective.push("-nologo".to_string());
     }
 
-    if subcommand == "test" && !has_logger_arg(args) {
-        effective.push("--logger".to_string());
-        effective.push("trx".to_string());
+    if subcommand == "test" {
+        if !has_trx_logger_arg(args) {
+            effective.push("--logger".to_string());
+            effective.push("trx".to_string());
+        }
 
         if !has_results_directory_arg(args) {
             if let Some(results_dir) = trx_results_dir {
@@ -329,11 +348,30 @@ fn has_nologo_arg(args: &[String]) -> bool {
         .any(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-nologo" | "/nologo"))
 }
 
-fn has_logger_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
+fn has_trx_logger_arg(args: &[String]) -> bool {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
         let lower = arg.to_ascii_lowercase();
-        lower.starts_with("--logger") || lower.starts_with("-l") || lower.contains("logger")
-    })
+        if lower == "--logger" || lower == "-l" {
+            if let Some(next) = iter.peek() {
+                let next_lower = next.to_ascii_lowercase();
+                if next_lower == "trx" || next_lower.starts_with("trx;") {
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        for prefix in ["--logger:", "--logger=", "-l:", "-l="] {
+            if let Some(value) = lower.strip_prefix(prefix) {
+                if value == "trx" || value.starts_with("trx;") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn has_results_directory_arg(args: &[String]) -> bool {
@@ -341,6 +379,30 @@ fn has_results_directory_arg(args: &[String]) -> bool {
         let lower = arg.to_ascii_lowercase();
         lower == "--results-directory" || lower.starts_with("--results-directory=")
     })
+}
+
+fn extract_results_directory_arg(args: &[String]) -> Option<PathBuf> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg.eq_ignore_ascii_case("--results-directory") {
+            if let Some(next) = iter.peek() {
+                return Some(PathBuf::from(next.as_str()));
+            }
+            continue;
+        }
+
+        if let Some((_, value)) = arg.split_once('=') {
+            if arg
+                .split('=')
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("--results-directory"))
+            {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+
+    None
 }
 
 fn normalize_build_summary(
@@ -1120,8 +1182,8 @@ mod tests {
         let injected = build_dotnet_args_for_test("test", &args, true);
         assert!(injected.contains(&"--logger".to_string()));
         assert!(injected.contains(&"console;verbosity=detailed".to_string()));
-        assert!(!injected.iter().any(|a| a == "trx"));
-        assert!(!injected.iter().any(|a| a == "--results-directory"));
+        assert!(injected.iter().any(|a| a == "trx"));
+        assert!(injected.iter().any(|a| a == "--results-directory"));
     }
 
     #[test]
@@ -1136,6 +1198,31 @@ mod tests {
     }
 
     #[test]
+    fn test_user_trx_logger_does_not_duplicate() {
+        let args = vec!["--logger".to_string(), "trx".to_string()];
+
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        let trx_logger_count = injected.iter().filter(|a| *a == "trx").count();
+        assert_eq!(trx_logger_count, 1);
+    }
+
+    #[test]
+    fn test_user_results_directory_prevents_extra_injection() {
+        let args = vec![
+            "--results-directory".to_string(),
+            "/custom/results".to_string(),
+        ];
+
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        assert!(!injected
+            .windows(2)
+            .any(|w| w[0] == "--results-directory" && w[1] == "/tmp/test results"));
+        assert!(injected
+            .windows(2)
+            .any(|w| w[0] == "--results-directory" && w[1] == "/custom/results"));
+    }
+
+    #[test]
     fn test_merge_test_summary_from_trx_uses_primary_and_cleans_file() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let primary = temp_dir.path().join("primary.trx");
@@ -1145,6 +1232,7 @@ mod tests {
             binlog::TestSummary::default(),
             Some(temp_dir.path()),
             None,
+            SystemTime::now(),
         );
 
         assert_eq!(filled.total, 3);
@@ -1163,6 +1251,7 @@ mod tests {
             binlog::TestSummary::default(),
             Some(&missing_primary),
             Some(fallback.clone()),
+            SystemTime::now(),
         );
 
         assert_eq!(filled.total, 2);
@@ -1175,8 +1264,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let missing = temp_dir.path().join("missing.trx");
 
-        let filled =
-            merge_test_summary_from_trx(binlog::TestSummary::default(), Some(&missing), None);
+        let filled = merge_test_summary_from_trx(
+            binlog::TestSummary::default(),
+            Some(&missing),
+            None,
+            SystemTime::now(),
+        );
         assert_eq!(filled.total, 0);
     }
 
@@ -1196,7 +1289,8 @@ mod tests {
             duration_text: Some("1 s".to_string()),
         };
 
-        let merged = merge_test_summary_from_trx(existing, Some(temp_dir.path()), None);
+        let merged =
+            merge_test_summary_from_trx(existing, Some(temp_dir.path()), None, SystemTime::now());
         assert_eq!(merged.total, 12);
         assert_eq!(merged.passed, 10);
         assert_eq!(merged.failed, 2);
@@ -1218,7 +1312,8 @@ mod tests {
             duration_text: Some("1 s".to_string()),
         };
 
-        let merged = merge_test_summary_from_trx(existing, Some(temp_dir.path()), None);
+        let merged =
+            merge_test_summary_from_trx(existing, Some(temp_dir.path()), None, SystemTime::now());
         assert_eq!(merged.total, 12);
         assert_eq!(merged.passed, 10);
         assert_eq!(merged.failed, 2);
@@ -1242,7 +1337,8 @@ mod tests {
             duration_text: Some("1 s".to_string()),
         };
 
-        let merged = merge_test_summary_from_trx(existing, Some(temp_dir.path()), None);
+        let merged =
+            merge_test_summary_from_trx(existing, Some(temp_dir.path()), None, SystemTime::now());
         assert_eq!(merged.project_count, 2);
     }
 
@@ -1256,6 +1352,42 @@ mod tests {
 
         let args = vec!["--logger".to_string(), "trx".to_string()];
         assert!(!has_results_directory_arg(&args));
+    }
+
+    #[test]
+    fn test_extract_results_directory_arg_detects_variants() {
+        let args = vec!["--results-directory".to_string(), "/tmp/r1".to_string()];
+        assert_eq!(
+            extract_results_directory_arg(&args),
+            Some(PathBuf::from("/tmp/r1"))
+        );
+
+        let args = vec!["--results-directory=/tmp/r2".to_string()];
+        assert_eq!(
+            extract_results_directory_arg(&args),
+            Some(PathBuf::from("/tmp/r2"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_trx_results_dir_user_directory_is_not_marked_for_cleanup() {
+        let args = vec![
+            "--results-directory".to_string(),
+            "/custom/results".to_string(),
+        ];
+
+        let (dir, cleanup) = resolve_trx_results_dir("test", &args);
+        assert_eq!(dir, Some(PathBuf::from("/custom/results")));
+        assert!(!cleanup);
+    }
+
+    #[test]
+    fn test_resolve_trx_results_dir_generated_directory_is_marked_for_cleanup() {
+        let args = Vec::<String>::new();
+
+        let (dir, cleanup) = resolve_trx_results_dir("test", &args);
+        assert!(dir.is_some());
+        assert!(cleanup);
     }
 
     #[test]

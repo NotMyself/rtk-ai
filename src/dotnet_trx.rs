@@ -3,6 +3,7 @@ use chrono::{DateTime, FixedOffset};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 fn local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|b| *b == b':').next().unwrap_or(name)
@@ -94,6 +95,10 @@ pub fn parse_trx_file(path: &Path) -> Option<TestSummary> {
 }
 
 pub fn parse_trx_files_in_dir(dir: &Path) -> Option<TestSummary> {
+    parse_trx_files_in_dir_since(dir, None)
+}
+
+pub fn parse_trx_files_in_dir_since(dir: &Path, since: Option<SystemTime>) -> Option<TestSummary> {
     if !dir.exists() || !dir.is_dir() {
         return None;
     }
@@ -106,6 +111,16 @@ pub fn parse_trx_files_in_dir(dir: &Path) -> Option<TestSummary> {
         let path = entry.path();
         if path.extension().map(|e| e == "trx") != Some(true) {
             continue;
+        }
+
+        if let Some(since) = since {
+            let modified = match entry.metadata().ok().and_then(|m| m.modified().ok()) {
+                Some(modified) => modified,
+                None => continue,
+            };
+            if modified < since {
+                continue;
+            }
         }
 
         let content = match std::fs::read_to_string(&path) {
@@ -525,5 +540,27 @@ mod tests {
         assert_eq!(summary.passed, 29);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.duration_text.as_deref(), Some("3.0 s"));
+    }
+
+    #[test]
+    fn test_parse_trx_files_in_dir_since_ignores_older_files() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let trx_dir = temp_dir.path().join("TestResults");
+        std::fs::create_dir_all(&trx_dir).expect("create TestResults");
+
+        let trx_old = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun><ResultSummary><Counters total="2" executed="2" passed="2" failed="0" /></ResultSummary></TestRun>"#;
+        std::fs::write(trx_dir.join("old.trx"), trx_old).expect("write old trx");
+        std::thread::sleep(Duration::from_millis(5));
+        let since = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(5));
+
+        let trx_new = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun><ResultSummary><Counters total="3" executed="3" passed="2" failed="1" /></ResultSummary></TestRun>"#;
+        std::fs::write(trx_dir.join("new.trx"), trx_new).expect("write new trx");
+
+        let summary = parse_trx_files_in_dir_since(&trx_dir, Some(since)).expect("merged summary");
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.failed, 1);
     }
 }
