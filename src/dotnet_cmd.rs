@@ -125,7 +125,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
             };
             let raw_summary = binlog::parse_test_from_text(&raw);
             let merged_summary = merge_test_summaries(parsed_summary, raw_summary);
-            let summary = maybe_fill_test_summary_from_trx(
+            let summary = merge_test_summary_from_trx(
                 merged_summary,
                 trx_path.as_deref(),
                 dotnet_trx::find_recent_trx_in_testresults(),
@@ -220,26 +220,45 @@ fn cleanup_temp_file(path: &Path) {
     }
 }
 
-fn maybe_fill_test_summary_from_trx(
-    summary: binlog::TestSummary,
+fn merge_test_summary_from_trx(
+    mut summary: binlog::TestSummary,
     trx_path: Option<&Path>,
     fallback_trx_path: Option<PathBuf>,
 ) -> binlog::TestSummary {
-    if summary.total != 0 || !summary.failed_tests.is_empty() {
-        return summary;
-    }
+    let mut trx_summary = None;
 
     if let Some(trx) = trx_path.filter(|path| path.exists()) {
-        if let Some(trx_summary) = dotnet_trx::parse_trx_file(trx) {
-            std::fs::remove_file(trx).ok();
-            return trx_summary;
+        trx_summary = dotnet_trx::parse_trx_file(trx);
+        std::fs::remove_file(trx).ok();
+    }
+
+    if trx_summary.is_none() {
+        if let Some(trx) = fallback_trx_path {
+            trx_summary = dotnet_trx::parse_trx_file(&trx);
         }
     }
 
-    if let Some(trx) = fallback_trx_path {
-        if let Some(trx_summary) = dotnet_trx::parse_trx_file(&trx) {
-            return trx_summary;
-        }
+    let Some(trx_summary) = trx_summary else {
+        return summary;
+    };
+
+    if trx_summary.total > 0 {
+        summary.passed = trx_summary.passed;
+        summary.failed = trx_summary.failed;
+        summary.skipped = trx_summary.skipped;
+        summary.total = trx_summary.total;
+    }
+
+    if summary.failed_tests.is_empty() && !trx_summary.failed_tests.is_empty() {
+        summary.failed_tests = trx_summary.failed_tests;
+    }
+
+    if let Some(duration) = trx_summary.duration_text {
+        summary.duration_text = Some(duration);
+    }
+
+    if summary.project_count == 0 && trx_summary.project_count > 0 {
+        summary.project_count = trx_summary.project_count;
     }
 
     summary
@@ -1097,13 +1116,13 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_fill_test_summary_from_trx_uses_primary_and_cleans_file() {
+    fn test_merge_test_summary_from_trx_uses_primary_and_cleans_file() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let primary = temp_dir.path().join("primary.trx");
         fs::write(&primary, trx_with_counts(3, 3, 0)).expect("write primary trx");
 
         let filled =
-            maybe_fill_test_summary_from_trx(binlog::TestSummary::default(), Some(&primary), None);
+            merge_test_summary_from_trx(binlog::TestSummary::default(), Some(&primary), None);
 
         assert_eq!(filled.total, 3);
         assert_eq!(filled.passed, 3);
@@ -1111,13 +1130,13 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_fill_test_summary_from_trx_falls_back_to_testresults() {
+    fn test_merge_test_summary_from_trx_falls_back_to_testresults() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let fallback = temp_dir.path().join("fallback.trx");
         fs::write(&fallback, trx_with_counts(2, 1, 1)).expect("write fallback trx");
         let missing_primary = temp_dir.path().join("missing.trx");
 
-        let filled = maybe_fill_test_summary_from_trx(
+        let filled = merge_test_summary_from_trx(
             binlog::TestSummary::default(),
             Some(&missing_primary),
             Some(fallback.clone()),
@@ -1129,13 +1148,35 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_fill_test_summary_from_trx_returns_default_when_no_trx() {
+    fn test_merge_test_summary_from_trx_returns_default_when_no_trx() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let missing = temp_dir.path().join("missing.trx");
 
         let filled =
-            maybe_fill_test_summary_from_trx(binlog::TestSummary::default(), Some(&missing), None);
+            merge_test_summary_from_trx(binlog::TestSummary::default(), Some(&missing), None);
         assert_eq!(filled.total, 0);
+    }
+
+    #[test]
+    fn test_merge_test_summary_from_trx_overrides_existing_counts() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let primary = temp_dir.path().join("primary.trx");
+        fs::write(&primary, trx_with_counts(5, 4, 1)).expect("write primary trx");
+
+        let existing = binlog::TestSummary {
+            passed: 10,
+            failed: 2,
+            skipped: 0,
+            total: 12,
+            project_count: 1,
+            failed_tests: Vec::new(),
+            duration_text: Some("1 s".to_string()),
+        };
+
+        let merged = merge_test_summary_from_trx(existing, Some(&primary), None);
+        assert_eq!(merged.total, 5);
+        assert_eq!(merged.passed, 4);
+        assert_eq!(merged.failed, 1);
     }
 
     #[test]

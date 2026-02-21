@@ -1,4 +1,5 @@
 use crate::binlog::{FailedTest, TestSummary};
+use chrono::DateTime;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,23 @@ fn parse_usize_attr(reader: &Reader<&[u8]>, start: &BytesStart<'_>, key: &[u8]) 
     extract_attr_value(reader, start, key)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0)
+}
+
+fn parse_trx_duration(start: &str, finish: &str) -> Option<String> {
+    let start_dt = DateTime::parse_from_rfc3339(start).ok()?;
+    let finish_dt = DateTime::parse_from_rfc3339(finish).ok()?;
+    let diff = finish_dt.signed_duration_since(start_dt);
+    let millis = diff.num_milliseconds();
+    if millis <= 0 {
+        return None;
+    }
+
+    if millis >= 1_000 {
+        let seconds = millis as f64 / 1_000.0;
+        return Some(format!("{seconds:.1} s"));
+    }
+
+    Some(format!("{millis} ms"))
 }
 
 /// Parse TRX (Visual Studio Test Results) file to extract test summary.
@@ -89,6 +107,13 @@ fn parse_trx_content(content: &str) -> Option<TestSummary> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
                 b"TestRun" => saw_test_run = true,
+                b"Times" => {
+                    let start = extract_attr_value(&reader, &e, b"start");
+                    let finish = extract_attr_value(&reader, &e, b"finish");
+                    if let (Some(start), Some(finish)) = (start, finish) {
+                        summary.duration_text = parse_trx_duration(&start, &finish);
+                    }
+                }
                 b"Counters" => {
                     summary.total = parse_usize_attr(&reader, &e, b"total");
                     summary.passed = parse_usize_attr(&reader, &e, b"passed");
@@ -128,6 +153,13 @@ fn parse_trx_content(content: &str) -> Option<TestSummary> {
                 _ => {}
             },
             Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                b"Times" => {
+                    let start = extract_attr_value(&reader, &e, b"start");
+                    let finish = extract_attr_value(&reader, &e, b"finish");
+                    if let (Some(start), Some(finish)) = (start, finish) {
+                        summary.duration_text = parse_trx_duration(&start, &finish);
+                    }
+                }
                 b"Counters" => {
                     summary.total = parse_usize_attr(&reader, &e, b"total");
                     summary.passed = parse_usize_attr(&reader, &e, b"passed");
@@ -247,6 +279,7 @@ mod tests {
     fn test_parse_trx_content_extracts_passed_counts() {
         let trx = r#"<?xml version="1.0" encoding="utf-8"?>
 <TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-02-21T12:57:28.3323710+01:00" queuing="2026-02-21T12:57:28.3323710+01:00" start="2026-02-21T12:57:27.7149650+01:00" finish="2026-02-21T12:57:30.2214710+01:00" />
   <ResultSummary outcome="Completed">
     <Counters total="42" executed="42" passed="40" failed="2" error="0" timeout="0" aborted="0" inconclusive="0" />
   </ResultSummary>
@@ -257,6 +290,7 @@ mod tests {
         assert_eq!(summary.passed, 40);
         assert_eq!(summary.failed, 2);
         assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.duration_text.as_deref(), Some("2.5 s"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::utils::strip_ansi;
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use lazy_static::lazy_static;
@@ -70,6 +71,10 @@ lazy_static! {
         Regex::new(r"(?m)^\s*Time Elapsed\s+(?P<duration>[^\r\n]+)$").expect("valid regex");
     static ref TEST_RESULT_RE: Regex = Regex::new(
         r"(?m)(?:Passed!|Failed!)\s*-\s*Failed:\s*(?P<failed>\d+),\s*Passed:\s*(?P<passed>\d+),\s*Skipped:\s*(?P<skipped>\d+),\s*Total:\s*(?P<total>\d+),\s*Duration:\s*(?P<duration>[^\r\n-]+)"
+    )
+    .expect("valid regex");
+    static ref TEST_SUMMARY_RE: Regex = Regex::new(
+        r"(?mi)^\s*Test summary:\s*total:\s*(?P<total>\d+),\s*failed:\s*(?P<failed>\d+),\s*(?:succeeded|passed):\s*(?P<passed>\d+),\s*skipped:\s*(?P<skipped>\d+),\s*duration:\s*(?P<duration>[^\r\n]+)$"
     )
     .expect("valid regex");
     static ref FAILED_TEST_HEAD_RE: Regex = Regex::new(
@@ -624,7 +629,8 @@ pub fn scrub_sensitive_env_vars(input: &str) -> String {
 }
 
 pub fn parse_build_from_text(text: &str) -> BuildSummary {
-    let scrubbed = scrub_sensitive_env_vars(text);
+    let clean = strip_ansi(text);
+    let scrubbed = scrub_sensitive_env_vars(&clean);
     let mut seen_errors: HashSet<(String, String, u32, u32, String)> = HashSet::new();
     let mut seen_warnings: HashSet<(String, String, u32, u32, String)> = HashSet::new();
     let mut summary = BuildSummary {
@@ -818,7 +824,8 @@ pub fn parse_build_from_text(text: &str) -> BuildSummary {
 }
 
 pub fn parse_test_from_text(text: &str) -> TestSummary {
-    let scrubbed = scrub_sensitive_env_vars(text);
+    let clean = strip_ansi(text);
+    let scrubbed = scrub_sensitive_env_vars(&clean);
     let mut summary = TestSummary {
         passed: 0,
         failed: 0,
@@ -857,6 +864,29 @@ pub fn parse_test_from_text(text: &str) -> TestSummary {
 
     if found_summary_line && summary.duration_text.is_none() {
         summary.duration_text = fallback_duration;
+    }
+
+    if let Some(captures) = TEST_SUMMARY_RE.captures_iter(&scrubbed).last() {
+        summary.passed = captures
+            .name("passed")
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .unwrap_or(summary.passed);
+        summary.failed = captures
+            .name("failed")
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .unwrap_or(summary.failed);
+        summary.skipped = captures
+            .name("skipped")
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .unwrap_or(summary.skipped);
+        summary.total = captures
+            .name("total")
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .unwrap_or(summary.total);
+
+        if let Some(duration) = captures.name("duration") {
+            summary.duration_text = Some(duration.as_str().trim().to_string());
+        }
     }
 
     let lines: Vec<&str> = scrubbed.lines().collect();
@@ -915,7 +945,8 @@ pub fn parse_test_from_text(text: &str) -> TestSummary {
 
 pub fn parse_restore_from_text(text: &str) -> RestoreSummary {
     let (errors, warnings) = parse_restore_issues_from_text(text);
-    let scrubbed = scrub_sensitive_env_vars(text);
+    let clean = strip_ansi(text);
+    let scrubbed = scrub_sensitive_env_vars(&clean);
 
     RestoreSummary {
         restored_projects: RESTORE_PROJECT_RE.captures_iter(&scrubbed).count(),
@@ -926,7 +957,8 @@ pub fn parse_restore_from_text(text: &str) -> RestoreSummary {
 }
 
 pub fn parse_restore_issues_from_text(text: &str) -> (Vec<BinlogIssue>, Vec<BinlogIssue>) {
-    let scrubbed = scrub_sensitive_env_vars(text);
+    let clean = strip_ansi(text);
+    let scrubbed = scrub_sensitive_env_vars(&clean);
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut seen_errors: HashSet<(String, String, u32, u32, String)> = HashSet::new();
@@ -1258,6 +1290,22 @@ Time Elapsed 00:00:12.34
         assert_eq!(summary.skipped, 7);
         assert_eq!(summary.total, 948);
         assert_eq!(summary.duration_text.as_deref(), Some("00:00:12.34"));
+    }
+
+    #[test]
+    fn test_parse_test_from_text_prefers_test_summary_duration_and_counts() {
+        let input = r#"
+Failed!  - Failed:     1, Passed:   940, Skipped:     7, Total:   948, Duration: 1 s
+Test summary: total: 949, failed: 1, succeeded: 940, skipped: 7, duration: 2.7s
+Build failed with 1 error(s) and 4 warning(s) in 6.0s
+"#;
+
+        let summary = parse_test_from_text(input);
+        assert_eq!(summary.passed, 940);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.skipped, 7);
+        assert_eq!(summary.total, 949);
+        assert_eq!(summary.duration_text.as_deref(), Some("2.7s"));
     }
 
     #[test]
