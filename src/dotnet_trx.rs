@@ -1,5 +1,5 @@
 use crate::binlog::{FailedTest, TestSummary};
-use chrono::DateTime;
+use chrono::{DateTime, FixedOffset};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,13 @@ fn parse_usize_attr(reader: &Reader<&[u8]>, start: &BytesStart<'_>, key: &[u8]) 
 fn parse_trx_duration(start: &str, finish: &str) -> Option<String> {
     let start_dt = DateTime::parse_from_rfc3339(start).ok()?;
     let finish_dt = DateTime::parse_from_rfc3339(finish).ok()?;
+    format_duration_between(start_dt, finish_dt)
+}
+
+fn format_duration_between(
+    start_dt: DateTime<FixedOffset>,
+    finish_dt: DateTime<FixedOffset>,
+) -> Option<String> {
     let diff = finish_dt.signed_duration_since(start_dt);
     let millis = diff.num_milliseconds();
     if millis <= 0 {
@@ -49,11 +56,95 @@ fn parse_trx_duration(start: &str, finish: &str) -> Option<String> {
     Some(format!("{millis} ms"))
 }
 
+fn parse_trx_time_bounds(content: &str) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if local_name(e.name().as_ref()) != b"Times" {
+                    buf.clear();
+                    continue;
+                }
+
+                let start = extract_attr_value(&reader, &e, b"start")?;
+                let finish = extract_attr_value(&reader, &e, b"finish")?;
+                let start_dt = DateTime::parse_from_rfc3339(&start).ok()?;
+                let finish_dt = DateTime::parse_from_rfc3339(&finish).ok()?;
+                return Some((start_dt, finish_dt));
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+
+        buf.clear();
+    }
+
+    None
+}
+
 /// Parse TRX (Visual Studio Test Results) file to extract test summary.
 /// Returns None if the file doesn't exist or isn't a valid TRX file.
 pub fn parse_trx_file(path: &Path) -> Option<TestSummary> {
     let content = std::fs::read_to_string(path).ok()?;
     parse_trx_content(&content)
+}
+
+pub fn parse_trx_files_in_dir(dir: &Path) -> Option<TestSummary> {
+    if !dir.exists() || !dir.is_dir() {
+        return None;
+    }
+
+    let mut summaries = Vec::new();
+    let mut min_start: Option<DateTime<FixedOffset>> = None;
+    let mut max_finish: Option<DateTime<FixedOffset>> = None;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "trx") != Some(true) {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+
+        if let Some((start, finish)) = parse_trx_time_bounds(&content) {
+            min_start = Some(min_start.map_or(start, |prev| prev.min(start)));
+            max_finish = Some(max_finish.map_or(finish, |prev| prev.max(finish)));
+        }
+
+        if let Some(summary) = parse_trx_content(&content) {
+            summaries.push(summary);
+        }
+    }
+
+    if summaries.is_empty() {
+        return None;
+    }
+
+    let mut merged = TestSummary::default();
+    for summary in summaries {
+        merged.passed += summary.passed;
+        merged.failed += summary.failed;
+        merged.skipped += summary.skipped;
+        merged.total += summary.total;
+        merged.failed_tests.extend(summary.failed_tests);
+        merged.project_count += summary.project_count.max(1);
+        if merged.duration_text.is_none() {
+            merged.duration_text = summary.duration_text;
+        }
+    }
+
+    if let (Some(start), Some(finish)) = (min_start, max_finish) {
+        merged.duration_text = format_duration_between(start, finish);
+    }
+
+    Some(merged)
 }
 
 pub fn find_recent_trx_in_testresults() -> Option<PathBuf> {
@@ -402,5 +493,37 @@ mod tests {
 
         let found = find_recent_trx_in_dir(&testresults_dir);
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_parse_trx_files_in_dir_aggregates_counts_and_wall_clock_duration() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let trx_dir = temp_dir.path().join("TestResults");
+        std::fs::create_dir_all(&trx_dir).expect("create TestResults");
+
+        let trx_one = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun>
+  <Times start="2026-02-21T12:57:27.0000000+01:00" finish="2026-02-21T12:57:30.0000000+01:00" />
+  <ResultSummary outcome="Completed">
+    <Counters total="10" executed="10" passed="9" failed="1" />
+  </ResultSummary>
+</TestRun>"#;
+
+        let trx_two = r#"<?xml version="1.0" encoding="utf-8"?>
+<TestRun>
+  <Times start="2026-02-21T12:57:28.0000000+01:00" finish="2026-02-21T12:57:29.0000000+01:00" />
+  <ResultSummary outcome="Completed">
+    <Counters total="20" executed="20" passed="20" failed="0" />
+  </ResultSummary>
+</TestRun>"#;
+
+        std::fs::write(trx_dir.join("a.trx"), trx_one).expect("write first trx");
+        std::fs::write(trx_dir.join("b.trx"), trx_two).expect("write second trx");
+
+        let summary = parse_trx_files_in_dir(&trx_dir).expect("merged summary");
+        assert_eq!(summary.total, 30);
+        assert_eq!(summary.passed, 29);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.duration_text.as_deref(), Some("3.0 s"));
     }
 }
