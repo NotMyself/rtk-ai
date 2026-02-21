@@ -6,10 +6,12 @@ use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOTNET_CLI_UI_LANGUAGE: &str = "DOTNET_CLI_UI_LANGUAGE";
 const DOTNET_CLI_UI_LANGUAGE_VALUE: &str = "en-US";
+static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn run_build(args: &[String], verbose: u8) -> Result<()> {
     run_dotnet_with_binlog("build", args, verbose)
@@ -202,21 +204,27 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
 }
 
 fn build_binlog_path(subcommand: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    std::env::temp_dir().join(format!("rtk_dotnet_{}_{}.binlog", subcommand, ts))
+    std::env::temp_dir().join(format!(
+        "rtk_dotnet_{}_{}.binlog",
+        subcommand,
+        unique_temp_suffix()
+    ))
 }
 
 fn build_trx_results_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("rtk_dotnet_testresults_{}", unique_temp_suffix()))
+}
+
+fn unique_temp_suffix() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let pid = std::process::id();
+    let seq = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    std::env::temp_dir().join(format!("rtk_dotnet_testresults_{}", ts))
+    // Keep suffix compact to avoid long temp paths while preserving practical uniqueness.
+    format!("{:x}{:x}{:x}", ts, pid, seq)
 }
 
 fn resolve_trx_results_dir(subcommand: &str, args: &[String]) -> (Option<PathBuf>, bool) {
