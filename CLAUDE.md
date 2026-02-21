@@ -1,3 +1,4 @@
+<<<<<<< C:\Users\bobby\AppData\Local\Temp\merge-target-1771697965525
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -614,3 +615,155 @@ rtk newcmd args
 # 7. Document
 # Update README.md, CHANGELOG.md, this file
 ```
+=======
+# Claude Instructions
+
+## Prime Directive
+
+> **Rules are provided by the `devenv-workflow` plugin** (user scope). They are STRICTLY ENFORCED and override all default behavior. Violations break workflows, lose work, or corrupt data.
+
+---
+
+## Critical Rules Summary
+
+These rules come from the `devenv-workflow` plugin. Here's what breaks if you violate them:
+
+| Rule File | Critical Requirement | What Breaks If Violated |
+|-----------|---------------------|------------------------|
+| `tracking-github.md` | Link PRs to issues with `Fixes #N` | Issues don't auto-close, no traceability |
+| `tracking-beads.md` | Sync both Beads AND GitHub Issues | Work becomes invisible, items orphaned |
+| `workflow-implementation.md` | Use `start-work` formula before coding | Work invisible, parent items never close |
+| `workflow-planning.md` | Never create items before plan approval | Wasted work, wrong structure |
+| `scripting-hooks.md` | All hooks must be Bun TypeScript | Cross-platform compatibility fails |
+| `style-csharp.md` | Use `is not null`, file-scoped namespaces (.NET 10+) | Linting errors, inconsistent codebase |
+| `workflow-agent-teams.md` | Max 3 agents, mandate template required, only lead closes parents | Context blowout, scope violations, orphaned work |
+
+---
+
+## Session Protocol (MANDATORY)
+
+**Work is NOT complete until pushed to remote.**
+
+Before ending ANY session, pour the session-end formula:
+
+<commands>
+```bash
+bd mol wisp session-end
+```
+</commands>
+
+This enforces the full sequence: `git status` → stage → commit → push → verify clean. Steps are dependency-ordered — you cannot skip ahead.
+
+**NEVER:**
+- Stop before completing the `session-end` wisp (leaves work stranded)
+- Say "ready to push when you are" (YOU must push)
+- Skip the wisp and do manual steps (the formula IS the guardrail)
+
+→ Full workflow: See `workflow-implementation.md` (plugin rule)
+
+---
+
+## Hard Rules
+
+These rules come from analyzing 540+ sessions. Violations caused reverts, lost work, or repeated debugging.
+
+| Rule | Consequence of Violation |
+|------|------------------------|
+| **Never delete failing tests** — fix them in place. If the fix isn't working, stop and ask for guidance. | Claude deleted 220 tests in one session, requiring full revert |
+| **GitHub workflow precision** — Always update acceptance criteria. Never truncate work item comments. Link PRs with `Fixes #N`. | Wrong state transitions and truncated comments |
+| **Context budget** — when context window is getting large (especially during parallel subagent work), proactively stop, commit progress, and generate a continuation prompt. Do NOT wait to be asked. Never try to squeeze in 'one more phase.' | 'Prompt is too long' errors during parallel work |
+| **Windows PowerShell** — use PowerShell-compatible syntax for all shell commands. Avoid Unix-specific date formats, `--since`/`--until` git flags (use `--after`/`--before`), and single-quote escaping patterns that don't work in PowerShell. | Shell syntax incompatibilities caused repeated debugging |
+| **Read actual code first** — before making architectural assumptions (e.g., 'stored procedures do full table scans'), READ the actual code. Never create ADRs or recommendations based on assumptions. | ADRs created on false premises, requiring reverts |
+| **Parallel subagent limits** — limit to 2-3 subagents per round. Commit between rounds. The most successful sessions used small batches. | Context window blowouts during parallel work |
+
+---
+
+## Plugin Architecture
+
+Workflow rules, hooks, skills, commands, and templates are provided by the **devenv-workflow** plugin installed at user scope. This replaces per-project rule/hook files.
+
+| Component | Source | Scope |
+|-----------|--------|-------|
+| Rules (11 files + code samples) | `devenv-workflow` plugin | User (all projects) |
+| Hooks (21 scripts) | `devenv-workflow` plugin | User (all projects) |
+| Skills (pipeline, debug-loop) | `devenv-workflow` plugin | User (all projects) |
+| Commands (/init) | `devenv-workflow` plugin | User (all projects) |
+| Templates (agent-mandate) | `devenv-workflow` plugin | User (all projects) |
+| Beads formulas (11) | `~/.beads/formulas/` | User (all projects) |
+| Status-line script | `~/.claude/scripts/` | User (all projects) |
+| Settings, .editorconfig, .gitattributes | Plugin scaffold | Project (provisioned on first session) |
+| CLAUDE.md | Plugin scaffold | Project (provisioned on first session) |
+
+---
+
+## Rule Adherence Evaluator
+
+Hooks enforce rule adherence at key checkpoints using Claude CLI as a semantic evaluator.
+
+| Checkpoint | Trigger | Mode | Purpose |
+|------------|---------|------|---------|
+| Pre-Flight | Before code editing | Blocking | Ensures workflow acknowledgment before coding |
+| Closing Check | `bd close` | Warning | Validates completion notes are adequate |
+| Post-Edit Build | Edit/Write `.cs` files | Warning | Runs `dotnet build` to catch compilation errors |
+| Session End | Stop | Warning | Checks for uncommitted code and unpushed changes |
+
+**Quick disable:**
+```bash
+export EVALUATOR_ENABLED=false           # Disable all checkpoints
+export EVALUATOR_PREFLIGHT_ENABLED=false # Disable pre-flight only
+```
+
+**Evaluator config:** Create `.claude/hooks/evaluator/evaluator.config.json` in any project for project-level overrides.
+
+---
+
+## Permissions
+
+**Pre-approved access:**
+- Git operations (except force push, hard reset)
+- .NET, npm, Docker, PowerShell commands
+- GitHub CLI (`gh`) for issues, PRs, actions
+- MCP tools for Docker and Chrome automation
+
+**Requires user confirmation:**
+- `git push --force`, `git reset --hard`
+- `docker system prune`
+- `rm -rf`, `Remove-Item -Recurse -Force`
+
+---
+
+## Available Slash Commands
+
+| Command | Purpose |
+|---------|---------|
+| `/init` | Guided dev environment setup (prerequisites, plugins, binaries) |
+| `/commit` | Create git commit with AI message |
+| `/commit-push-pr` | Commit, push, and create PR |
+| `/clean_gone` | Remove branches deleted on remote |
+| `/code-review` | Comprehensive code review |
+| `/plannotator-review` | Interactive code review |
+| `/beads` | Full beads workflow guide |
+| `/ready` | Show ready-to-work issues |
+| `/blocked` | Show blocked issues |
+| `/stats` | Project statistics |
+| `/show <id>` | Issue details |
+| `/search <query>` | Search issues |
+| `/pipeline` | Agent pipeline orchestration → See `workflow-agent-teams.md` |
+
+---
+
+## Error Recovery
+
+<commands>
+```bash
+# Beads issues
+bd doctor              # Diagnose problems
+
+# Session context lost (after compaction or new session)
+bd prime               # Reload beads context (auto-runs via hooks)
+bd ready               # Find where you left off
+```
+</commands>
+
+→ Full error recovery: See `tracking-beads.md` (Edge Cases section)
+>>>>>>> C:\Users\bobby\AppData\Local\Temp\merge-source-1771697965525

@@ -1,0 +1,4 @@
+
+# Force LF for gitignore — CRLF blank lines cause git to treat \r as a
+# catch-all directory ignore pattern (git 2.53.0 / Windows autocrlf=true)
+.gitignore text eol=lf

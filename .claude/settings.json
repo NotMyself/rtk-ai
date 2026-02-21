@@ -1,0 +1,47 @@
+{
+  "model": "opus",
+  "includeCoAuthoredBy": false,
+  "teammateMode": "in_process",
+
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "high",
+    "CLAUDE_CODE_PLAN_MODE_REQUIRED": "1",
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_SOUND_ENABLED": "1"
+  },
+
+  "enabledPlugins": {
+    "devenv-workflow@ai-nme-marketplace": true,
+    "beads@beads-marketplace": true,
+    "plannotator@plannotator": true,
+    "code-review@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "csharp-lsp@claude-plugins-official": true
+  },
+
+  "permissions": {
+    "allow": [
+      "Bash(pwsh:*)",
+      "Bash(git:*)",
+      "Bash(dotnet:*)",
+      "Bash(code:*)",
+      "Bash(gh:*)",
+      "Bash(docker:*)",
+      "Bash(npm:*)",
+      "Bash(bun:*)",
+      "Bash(wget:*)",
+      "Bash(curl:*)"
+    ],
+    "deny": [],
+    "ask": [
+      "Bash(git push --force:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(gh auth:*)",
+      "Bash(docker system prune:*)",
+      "Bash(rm -rf:*)",
+      "Bash(Remove-Item :* -Recurse -Force:*)"
+    ]
+  }
+}

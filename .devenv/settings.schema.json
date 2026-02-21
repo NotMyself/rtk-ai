@@ -1,0 +1,182 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.com/devenv/settings.schema.json",
+  "title": "Dev Environment Settings",
+  "description": "Configuration for Claude Code development environment. Split across settings.json (project, committed) and settings.local.json (user, gitignored).",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Reference to this schema file"
+    },
+    "project": {
+      "type": "object",
+      "description": "Project identity (in settings.json, committed, fork-specific)",
+      "properties": {
+        "companyName": {
+          "type": "string",
+          "description": "Display name of the company/org (e.g., Acme Corp, NotMyself.IO)"
+        },
+        "shortName": {
+          "type": "string",
+          "description": "Short prefix used in repo names and identifiers (e.g., tw, nme)"
+        }
+      },
+      "required": ["companyName", "shortName"]
+    },
+    "plugin": {
+      "type": "object",
+      "description": "Plugin deployment settings (in settings.json, committed, fork-specific)",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Plugin name as installed (e.g., devenv-workflow)"
+        },
+        "marketplace": {
+          "type": "object",
+          "description": "Marketplace where the plugin is registered for discovery",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Marketplace identifier used in plugin spec (e.g., devenv-workflow)"
+            },
+            "githubRepo": {
+              "type": "string",
+              "description": "GitHub owner/repo for the marketplace (e.g., your-org/ai-devenv-workflow)"
+            },
+            "gitRemote": {
+              "type": "string",
+              "description": "Git SSH remote URL for marketplace clone/push operations"
+            },
+            "repoUrl": {
+              "type": "string",
+              "format": "uri",
+              "description": "HTTPS marketplace repo URL for links"
+            }
+          },
+          "required": ["name", "githubRepo", "gitRemote", "repoUrl"]
+        },
+        "distribution": {
+          "type": "object",
+          "description": "Plugin distribution repo where actual plugin files are published",
+          "properties": {
+            "githubRepo": {
+              "type": "string",
+              "description": "GitHub owner/repo for the plugin distribution (e.g., your-org/ai-plugin-devenv)"
+            },
+            "gitRemote": {
+              "type": "string",
+              "description": "Git SSH remote URL for plugin clone/push operations"
+            },
+            "repoUrl": {
+              "type": "string",
+              "format": "uri",
+              "description": "HTTPS plugin repo URL for changelogs and links"
+            }
+          },
+          "required": ["githubRepo", "gitRemote", "repoUrl"]
+        }
+      },
+      "required": ["name", "marketplace"]
+    },
+    "azureDevOps": {
+      "type": "object",
+      "description": "Azure DevOps settings (in settings.json, committed, optional)",
+      "properties": {
+        "orgUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Azure DevOps organization URL (e.g., https://dev.azure.com/your-org)"
+        },
+        "project": {
+          "type": "string",
+          "description": "Azure DevOps project name"
+        },
+        "area": {
+          "type": "string",
+          "description": "Default area path for work items"
+        },
+        "defaultIteration": {
+          "type": "string",
+          "description": "Default iteration path for work items"
+        }
+      },
+      "required": ["orgUrl", "project", "area", "defaultIteration"]
+    },
+    "sync": {
+      "type": "object",
+      "description": "Repository sync configuration (in settings.json, committed). Replaces .claude/sync-config.json.",
+      "properties": {
+        "peerRepo": {
+          "type": ["string", "null"],
+          "description": "Absolute path to peer fork repository for bidirectional sync"
+        },
+        "exclusions": {
+          "type": "object",
+          "description": "Files and paths to protect during sync operations",
+          "properties": {
+            "global": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Filenames excluded from all categories"
+            },
+            "categories": {
+              "type": "object",
+              "description": "Per-category exclusion overrides",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Filenames to skip for this category"
+                  },
+                  "protectedJsonPaths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Dot-notation JSON paths to preserve during merge"
+                  },
+                  "protectedSections": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Markdown heading strings to preserve during merge"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "nameTransforms": {
+          "type": "array",
+          "description": "Content substitutions applied during sync (e.g., company name changes)",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "description": "Text to find in incoming content"
+              },
+              "to": {
+                "type": "string",
+                "description": "Replacement text"
+              }
+            },
+            "required": ["from", "to"]
+          }
+        }
+      }
+    },
+    "user": {
+      "type": "object",
+      "description": "User-specific settings (in settings.local.json, gitignored)",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User's email address for this project"
+        }
+      },
+      "required": ["email"]
+    }
+  }
+}
