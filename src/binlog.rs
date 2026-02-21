@@ -115,11 +115,26 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
     "TMP",
     "SSH_AUTH_SOCK",
     "SSH_AGENT_LAUNCHER",
+    "GH_TOKEN",
     "GITHUB_TOKEN",
+    "GITHUB_PAT",
     "NUGET_API_KEY",
+    "NUGET_AUTH_TOKEN",
+    "VSS_NUGET_EXTERNAL_FEED_ENDPOINTS",
     "AZURE_DEVOPS_TOKEN",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "API_TOKEN",
+    "AUTH_TOKEN",
+    "ACCESS_TOKEN",
+    "BEARER_TOKEN",
+    "PASSWORD",
+    "CONNECTION_STRING",
+    "DATABASE_URL",
     "DOCKER_CONFIG",
     "KUBECONFIG",
 ];
@@ -1101,6 +1116,19 @@ mod tests {
         assert!(scrubbed.contains("GITHUB_TOKEN=[REDACTED]"));
         assert!(!scrubbed.contains("/usr/local/bin"));
         assert!(!scrubbed.contains("ghp_123"));
+    }
+
+    #[test]
+    fn test_scrub_sensitive_env_vars_masks_token_and_connection_values() {
+        let input = "GH_TOKEN=ghs_abc AWS_SESSION_TOKEN=aws_xyz CONNECTION_STRING=Server=localhost";
+        let scrubbed = scrub_sensitive_env_vars(input);
+
+        assert!(scrubbed.contains("GH_TOKEN=[REDACTED]"));
+        assert!(scrubbed.contains("AWS_SESSION_TOKEN=[REDACTED]"));
+        assert!(scrubbed.contains("CONNECTION_STRING=[REDACTED]"));
+        assert!(!scrubbed.contains("ghs_abc"));
+        assert!(!scrubbed.contains("aws_xyz"));
+        assert!(!scrubbed.contains("Server=localhost"));
     }
 
     #[test]
