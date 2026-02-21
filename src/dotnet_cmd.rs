@@ -183,8 +183,10 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         &filtered,
     );
 
+    cleanup_temp_file(&binlog_path);
+
     if verbose > 0 {
-        eprintln!("Binlog saved: {}", binlog_path.display());
+        eprintln!("Binlog cleaned up: {}", binlog_path.display());
     }
 
     if !output.status.success() {
@@ -210,6 +212,12 @@ fn build_trx_path() -> PathBuf {
         .unwrap_or(0);
 
     std::env::temp_dir().join(format!("rtk_dotnet_test_{}.trx", ts))
+}
+
+fn cleanup_temp_file(path: &Path) {
+    if path.exists() {
+        std::fs::remove_file(path).ok();
+    }
 }
 
 fn maybe_fill_test_summary_from_trx(
@@ -1128,5 +1136,26 @@ mod tests {
         let filled =
             maybe_fill_test_summary_from_trx(binlog::TestSummary::default(), Some(&missing), None);
         assert_eq!(filled.total, 0);
+    }
+
+    #[test]
+    fn test_cleanup_temp_file_removes_existing_file() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_file = temp_dir.path().join("temp.binlog");
+        fs::write(&temp_file, "content").expect("write temp file");
+
+        cleanup_temp_file(&temp_file);
+
+        assert!(!temp_file.exists());
+    }
+
+    #[test]
+    fn test_cleanup_temp_file_ignores_missing_file() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing_file = temp_dir.path().join("missing.binlog");
+
+        cleanup_temp_file(&missing_file);
+
+        assert!(!missing_file.exists());
     }
 }
