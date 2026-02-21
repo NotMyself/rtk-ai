@@ -223,13 +223,27 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         _ => raw.clone(),
     };
 
-    println!("{}", filtered);
+    let output_to_print = if !output.status.success() {
+        let stdout_trimmed = stdout.trim();
+        let stderr_trimmed = stderr.trim();
+        if !stdout_trimmed.is_empty() {
+            format!("{}\n\n{}", stdout_trimmed, filtered)
+        } else if !stderr_trimmed.is_empty() {
+            format!("{}\n\n{}", stderr_trimmed, filtered)
+        } else {
+            filtered
+        }
+    } else {
+        filtered
+    };
+
+    println!("{}", output_to_print);
 
     timer.track(
         &format!("dotnet {} {}", subcommand, args.join(" ")),
         &format!("rtk dotnet {} {}", subcommand, args.join(" ")),
         &raw,
-        &filtered,
+        &output_to_print,
     );
 
     cleanup_temp_file(&binlog_path);
